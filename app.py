@@ -71,16 +71,18 @@ def login():
                 user_id=user.id,
                 ip_address=ip_address,
                 user_agent=user_agent,
-                login_time=login_time
+                login_time=login_time,
+                label=label_attempt(user.id, ip_address)
             )
             db.session.add(login_attempt)
             db.session.commit()
 
-            # Retrain model with new data (Optional)
-            # prepare_and_train_model()
+            # Retrain model with new data
+            prepare_and_train_model()
 
             # Risk assessment
             risk_score = assess_risk_ml(ip_address, user_agent, login_time, user)
+            print(f"Risk score for user {user.username}: {risk_score}")
 
             if risk_score < 0.5:
                 # Low risk - allow login
@@ -100,15 +102,36 @@ def login():
 @app.route('/dashboard')
 def dashboard():
     if 'user_id' in session:
-        user = User.query.get(session['user_id'])
-        return render_template('dashboard.html', username=user.username)
+        user = db.session.get(User, session['user_id'])
+        risk_score = session.get('risk_score', 'N/A')
+        return render_template('dashboard.html', username=user.username, risk_score=risk_score)
     else:
         return redirect(url_for('login'))
+
 
 @app.route('/verify_identity', methods=['GET', 'POST'])
 def verify_identity():
     # Implement OTP or security questions
     return 'Additional verification required.'
+
+def label_attempt(user_id, ip_address):
+    previous_attempts = LoginAttempt.query.filter_by(user_id=user_id).all()
+    previous_ips = set(a.ip_address for a in previous_attempts)
+    if ip_address in previous_ips:
+        return 0  # Legitimate
+    else:
+        return 1  # Anomalous
+
+
+def is_anomalous(attempt):
+    # Define criteria for anomalous attempts
+    # For example, IP address not seen before for this user
+    user_attempts = [a for a in LoginAttempt.query.filter_by(user_id=attempt['user_id']).all()]
+    previous_ips = set(a.ip_address for a in user_attempts if a.ip_address != attempt['ip_address'])
+    if attempt['ip_address'] not in previous_ips:
+        return True
+    return False
+
 
 def assess_risk_ml(ip_address, user_agent, login_time, user):
     global model
@@ -160,13 +183,16 @@ def prepare_and_train_model():
     data = []
 
     for attempt in attempts:
-        data.append({
+        attempt_data = {
             'user_id': attempt.user_id,
             'ip_address': attempt.ip_address,
             'user_agent': attempt.user_agent,
             'login_time': attempt.login_time.hour,
-            'label': 0  # Initially label all as legitimate
-        })
+            'label': attempt.label  # Use label from database
+        }
+        if is_anomalous(attempt_data):
+            attempt_data['label'] = 1  # Label as anomalous
+        data.append(attempt_data)
 
     # If no data is available, create dummy data
     if not data:

@@ -13,3 +13,4 @@ class LoginAttempt(db.Model):
     ip_address = db.Column(db.String(100), nullable=False)
     user_agent = db.Column(db.String(300), nullable=False)
     login_time = db.Column(db.DateTime, nullable=False)
+    label = db.Column(db.Integer, nullable=False)  # New field
