@@ -1,0 +1,11 @@
+<!-- templates/verify_identity.html -->
+{% extends 'base.html' %}
+
+{% block content %}
+<h1>Additional Verification Required</h1>
+<p>Please enter the verification code sent to your email.</p>
+<form method="POST">
+    <input type="text" name="otp" placeholder="Enter verification code" required>
+    <button type="submit">Verify</button>
+</form>
+{% endblock %}
