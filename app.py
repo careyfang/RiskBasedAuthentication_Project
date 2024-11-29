@@ -69,21 +69,31 @@ def register():
     if request.method == 'POST':
         # Get form data
         username = request.form['username']
-        password = generate_password_hash(request.form['password'])
+        password = request.form['password']
+        confirm_password = request.form['confirm_password']
         email = request.form['email']
         phone_number = request.form.get('phone_number')  # Optional
         security_question = request.form['security_question']
         security_answer = generate_password_hash(request.form['security_answer'])
 
+        # Validate password confirmation
+        if password != confirm_password:
+            flash('Passwords do not match. Please try again.')
+            return render_template('register.html')
+
+        # Hash the password
+        password_hash = generate_password_hash(password)
+
         # Check if user already exists
         existing_user = User.query.filter_by(username=username).first()
         if existing_user:
-            return 'Username already exists. Please choose another one.'
+            flash('Username already exists. Please choose another one.')
+            return render_template('register.html')
 
         # Create user but don't commit yet
         new_user = User(
             username=username,
-            password=password,
+            password=password_hash,
             email=email,
             phone_number=phone_number,
             security_question=security_question,
@@ -102,7 +112,6 @@ def register():
         try:
             mail.send(msg)
             print(f"Confirmation email sent to {email}")
-            # **Commit the new user to the database**
             db.session.commit()
         except Exception as e:
             print(f"Failed to send confirmation email: {e}")
@@ -113,6 +122,7 @@ def register():
         return 'A confirmation email has been sent. Please check your email to complete registration.'
 
     return render_template('register.html')
+
 
 
 @app.route('/security_question', methods=['GET', 'POST'])
