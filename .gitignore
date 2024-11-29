@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Virtual Environments
+env/
+venv/
+.venv/
+
+# Database files
+*.sqlite3
+*.db
+
+# Environment variables
+.env
+
+# Flask cache and session files
+instance/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace

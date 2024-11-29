@@ -6,23 +6,25 @@ from random import randint
 import requests
 import pandas as pd
 import numpy as np
+import os
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.ensemble import RandomForestClassifier
 from itsdangerous import URLSafeTimedSerializer
 from flask_mail import Mail, Message
-
+from dotenv import load_dotenv
 
 app = Flask(__name__)
 app.secret_key = 'your_secret_key'  # Replace with a secure key
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///rba.db'
 
 # Email configuration for OTP
+load_dotenv()
 app.config['MAIL_SERVER'] = 'smtp.gmail.com'  # Replace with your SMTP server
 app.config['MAIL_PORT'] = 587  # Replace with your mail server port
 app.config['MAIL_USE_TLS'] = True
-app.config['MAIL_USERNAME'] = 'RBA.OTP.TEST@gmail.com'  # Replace with your email
-app.config['MAIL_PASSWORD'] = '1qaz2wsx3edc!'  # Replace with your email password
+app.config['MAIL_USERNAME'] = os.environ.get('MAIL_USERNAME')
+app.config['MAIL_PASSWORD'] = os.environ.get('MAIL_PASSWORD')
 
 db.init_app(app)
 mail = Mail(app)
@@ -100,6 +102,8 @@ def register():
         try:
             mail.send(msg)
             print(f"Confirmation email sent to {email}")
+            # **Commit the new user to the database**
+            db.session.commit()
         except Exception as e:
             print(f"Failed to send confirmation email: {e}")
             db.session.rollback()
@@ -109,6 +113,7 @@ def register():
         return 'A confirmation email has been sent. Please check your email to complete registration.'
 
     return render_template('register.html')
+
 
 @app.route('/security_question', methods=['GET', 'POST'])
 def security_question():
