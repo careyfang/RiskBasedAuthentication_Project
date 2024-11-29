@@ -1,0 +1,15 @@
+<!-- templates/unlock_account.html -->
+{% extends 'base.html' %}
+
+{% block title %}Unlock Account{% endblock %}
+
+{% block content %}
+<h1>Unlock Your Account</h1>
+<form method="POST">
+    <input type="text" name="username" placeholder="Username" required><br>
+    <button type="submit">Next</button>
+</form>
+{% for message in get_flashed_messages() %}
+    <p>{{ message }}</p>
+{% endfor %}
+{% endblock %}

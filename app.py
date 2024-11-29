@@ -47,6 +47,42 @@ def retrain_model():
     prepare_and_train_model()
     return 'Model retrained with new data.'
 
+@app.route('/unlock_account', methods=['GET', 'POST'])
+def unlock_account():
+    if request.method == 'POST':
+        # Check if the form is for username submission or security answer
+        if 'username' in request.form:
+            username = request.form['username']
+            user = User.query.filter_by(username=username).first()
+            if user:
+                # Store the username in session to use in the next step
+                session['unlock_username'] = username
+                return render_template('security_question.html', question=user.security_question)
+            else:
+                flash('Username not found. Please try again.')
+                return render_template('unlock_account.html')
+        elif 'security_answer' in request.form:
+            security_answer = request.form['security_answer']
+            username = session.get('unlock_username')
+            if not username:
+                flash('Session expired. Please try unlocking your account again.')
+                return redirect(url_for('unlock_account'))
+            user = User.query.filter_by(username=username).first()
+            if user and check_password_hash(user.security_answer, security_answer):
+                # Unlock the account
+                user.failed_attempts = 0
+                user.is_locked = False
+                db.session.commit()
+                flash('Your account has been unlocked. You can now log in.')
+                # Remove the username from session
+                session.pop('unlock_username', None)
+                return redirect(url_for('login'))
+            else:
+                flash('Incorrect security answer. Please try again.')
+                return render_template('security_question.html', question=user.security_question)
+    return render_template('unlock_account.html')
+
+
 @app.route('/confirm/<token>')
 def confirm_email(token):
     try:
@@ -59,10 +95,9 @@ def confirm_email(token):
     if user:
         user.is_active = True  # You need to add this field to your User model
         db.session.commit()
-        return 'Email confirmed! You can now log in.'
+        return render_template('email_confirmed.html')
     else:
         return 'User not found.', 404
-
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
@@ -72,7 +107,6 @@ def register():
         password = request.form['password']
         confirm_password = request.form['confirm_password']
         email = request.form['email']
-        phone_number = request.form.get('phone_number')  # Optional
         security_question = request.form['security_question']
         security_answer = generate_password_hash(request.form['security_answer'])
 
@@ -95,7 +129,6 @@ def register():
             username=username,
             password=password_hash,
             email=email,
-            phone_number=phone_number,
             security_question=security_question,
             security_answer=security_answer
         )
@@ -207,23 +240,32 @@ def login():
         if user:
             if not user.is_active:
                 return 'Please confirm your email before logging in.', 401
+            
+            if user.is_locked:
+                return 'Your account is locked. Please unlock from the login page.', 403
 
             if not check_password_hash(user.password, password):
                 # Incorrect password
                 user.failed_attempts += 1
-                db.session.commit()
 
                 # Lock account after too many failed attempts
                 MAX_FAILED_ATTEMPTS = 5
                 if user.failed_attempts >= MAX_FAILED_ATTEMPTS:
-                    return 'Account locked due to too many failed login attempts.', 403
+                    user.is_locked = True
+                    db.session.commit()
+                    return 'Your account is locked. Please unlock from the login page.', 403
 
+                db.session.commit()
                 return 'Invalid credentials', 401
 
             # Correct password
             # Reset failed attempts
             user.failed_attempts = 0
             db.session.commit()
+
+            # Check if the account was previously locked
+            if user.is_locked:
+                return 'Your account is locked. Please unlock from the login page.', 403
 
             # Collect contextual data
             ip_address = get_client_ip()
@@ -278,14 +320,23 @@ def login():
 
     return render_template('login.html')
 
+# Example function where the warning occurs
 @app.route('/dashboard')
 def dashboard():
-    if 'user_id' in session:
-        user = db.session.get(User, session['user_id'])
-        risk_score = session.get('risk_score', 'N/A')
-        return render_template('dashboard.html', username=user.username, risk_score=risk_score)
-    else:
+    user_id = session.get('user_id')
+    if not user_id:
+        # Handle the case where user_id is not in session
+        flash('Session expired. Please log in again.')
         return redirect(url_for('login'))
+    
+    user = db.session.get(User, user_id)
+    if not user:
+        flash('User not found.')
+        return redirect(url_for('login'))
+
+    risk_score = session.get('risk_score', 'N/A')
+    return render_template('dashboard.html', username=user.username, risk_score=risk_score)
+
 
 @app.route('/verify_identity', methods=['GET', 'POST'])
 def verify_identity():
@@ -451,6 +502,14 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
     typical_hours = get_user_typical_hours(user.id)
     time_anomaly = 1 if login_time.hour not in typical_hours else 0
 
+    # Calculate the number of recent failed attempts (e.g., in the last hour)
+    recent_failed_attempts = LoginAttempt.query.filter_by(
+        user_id=user.id,
+        label=1  # Assuming label 1 indicates a failed attempt
+    ).filter(
+        LoginAttempt.login_time >= datetime.datetime.now() - datetime.timedelta(hours=1)
+    ).count()
+
     input_data = pd.DataFrame({
         'ip_encoded': [ip_encoded],
         'agent_encoded': [agent_encoded],
@@ -460,6 +519,7 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
         'region_encoded': [region_encoded],
         'city_encoded': [city_encoded],
         'failed_attempts': [user.failed_attempts],
+        'recent_failed_attempts': [recent_failed_attempts],
         'time_anomaly': [time_anomaly],
     })
 
@@ -503,6 +563,14 @@ def prepare_and_train_model():
         typical_hours = get_user_typical_hours(user.id)
         time_anomaly = 1 if attempt.login_hour not in typical_hours else 0
 
+        # Calculate recent_failed_attempts (e.g., in the last hour before this attempt)
+        time_threshold = attempt.login_time - datetime.timedelta(hours=1)
+        recent_failed = LoginAttempt.query.filter(
+            LoginAttempt.user_id == user.id,
+            LoginAttempt.login_time >= time_threshold,
+            LoginAttempt.label == 1  # Assuming label=1 indicates a failed attempt
+        ).count()
+
         attempt_data = {
             'user_id': attempt.user_id,
             'ip_address': attempt.ip_address,
@@ -513,6 +581,7 @@ def prepare_and_train_model():
             'region': attempt.region if attempt.region else 'Unknown',
             'city': attempt.city if attempt.city else 'Unknown',
             'failed_attempts': user.failed_attempts,
+            'recent_failed_attempts': recent_failed,
             'time_anomaly': time_anomaly,
             'label': attempt.label
         }
@@ -532,6 +601,7 @@ def prepare_and_train_model():
                 'region': 'RegionA',
                 'city': 'CityA',
                 'failed_attempts': 0,
+                'recent_failed_attempts': 0,
                 'time_anomaly': 0,
                 'label': 0
             },
@@ -545,6 +615,7 @@ def prepare_and_train_model():
                 'region': 'RegionB',
                 'city': 'CityB',
                 'failed_attempts': 3,
+                'recent_failed_attempts': 1,
                 'time_anomaly': 1,
                 'label': 1
             }
@@ -571,6 +642,7 @@ def prepare_and_train_model():
                     'region': 'RegionA' if label == 0 else 'RegionB',
                     'city': 'CityA' if label == 0 else 'CityB',
                     'failed_attempts': 0 if label == 0 else 3,
+                    'recent_failed_attempts': 0 if label == 0 else 1,
                     'time_anomaly': 0 if label == 0 else 1,
                     'label': label
                 }])
@@ -591,7 +663,7 @@ def prepare_and_train_model():
 
     # Features and Labels
     X = df[['ip_encoded', 'agent_encoded', 'login_time', 'login_day', 'country_encoded',
-            'region_encoded', 'city_encoded', 'failed_attempts', 'time_anomaly']]
+            'region_encoded', 'city_encoded', 'failed_attempts', 'recent_failed_attempts', 'time_anomaly']]
     y = df['label']
 
     n_samples = len(df)

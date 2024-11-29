@@ -1,0 +1,10 @@
+{% extends 'base.html' %}
+
+{% block title %}Email Confirmed{% endblock %}
+
+{% block content %}
+<meta http-equiv="refresh" content="5;url={{ url_for('login') }}">
+<h1>Email Confirmed</h1>
+<p>Your email has been confirmed. You will be redirected to the login page shortly.</p>
+<p>If you are not redirected, <a href="{{ url_for('login') }}">click here</a>.</p>
+{% endblock %}
