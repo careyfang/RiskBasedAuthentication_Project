@@ -8,11 +8,11 @@ import pandas as pd
 import numpy as np
 import os
 from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import StratifiedShuffleSplit
-from sklearn.ensemble import RandomForestClassifier
 from itsdangerous import URLSafeTimedSerializer
 from flask_mail import Mail, Message
 from dotenv import load_dotenv
+from sklearn.ensemble import GradientBoostingClassifier
+import logging
 
 app = Flask(__name__)
 app.secret_key = 'your_secret_key'  # Replace with a secure key
@@ -32,11 +32,14 @@ serializer = URLSafeTimedSerializer(app.secret_key)
 
 # Global variables for the model and encoders
 model = None
-encoder_ip = None
-encoder_agent = None
-encoder_country = None
-encoder_region = None
-encoder_city = None
+encoder_ip = LabelEncoder()
+encoder_agent = LabelEncoder()
+encoder_country = LabelEncoder()
+encoder_region = LabelEncoder()
+encoder_city = LabelEncoder()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 @app.route('/')
 def index():
@@ -156,8 +159,6 @@ def register():
 
     return render_template('register.html')
 
-
-
 @app.route('/security_question', methods=['GET', 'POST'])
 def security_question():
     user_id = session.get('user_id')
@@ -207,8 +208,6 @@ def security_question():
     else:
         return render_template('security_question.html', question=user.security_question)
 
-
-
 def get_client_ip():
     if request.headers.getlist("X-Forwarded-For"):
         ip = request.headers.getlist("X-Forwarded-For")[0]
@@ -239,10 +238,12 @@ def login():
 
         if user:
             if not user.is_active:
-                return 'Please confirm your email before logging in.', 401
-            
+                flash('Please confirm your email before logging in.')
+                return render_template('login.html')
+
             if user.is_locked:
-                return 'Your account is locked. Please unlock from the login page.', 403
+                flash('Your account is locked.')
+                return render_template('login.html', show_unlock=True, username=username)
 
             if not check_password_hash(user.password, password):
                 # Incorrect password
@@ -253,19 +254,17 @@ def login():
                 if user.failed_attempts >= MAX_FAILED_ATTEMPTS:
                     user.is_locked = True
                     db.session.commit()
-                    return 'Your account is locked. Please unlock from the login page.', 403
+                    flash('Your account has been locked due to too many failed attempts.')
+                    return render_template('login.html', show_unlock=True, username=username)
 
                 db.session.commit()
-                return 'Invalid credentials', 401
+                flash('Invalid credentials')
+                return render_template('login.html')
 
             # Correct password
             # Reset failed attempts
             user.failed_attempts = 0
             db.session.commit()
-
-            # Check if the account was previously locked
-            if user.is_locked:
-                return 'Your account is locked. Please unlock from the login page.', 403
 
             # Collect contextual data
             ip_address = get_client_ip()
@@ -283,9 +282,9 @@ def login():
                 login_time=login_time,
                 login_hour=login_hour,
                 login_day=login_day,
-                country=country,
-                region=region,
-                city=city,
+                country=country if country else 'Unknown',
+                region=region if region else 'Unknown',
+                city=city if city else 'Unknown',
                 label=label_attempt(user.id, ip_address, user_agent, country, region, city)
             )
             db.session.add(login_attempt)
@@ -300,6 +299,9 @@ def login():
             # Risk assessment
             risk_score = assess_risk_ml(ip_address, user_agent, login_time, country, region, city, user)
             print(f"Risk score for user {user.username}: {risk_score}")
+
+            # Save risk_score in session
+            session['risk_score'] = risk_score
 
             if risk_score < 0.5:
                 # Low risk - allow login
@@ -316,11 +318,11 @@ def login():
 
         else:
             # User does not exist
-            return 'Invalid credentials', 401
+            flash('Invalid credentials')
+            return render_template('login.html')
 
     return render_template('login.html')
 
-# Example function where the warning occurs
 @app.route('/dashboard')
 def dashboard():
     user_id = session.get('user_id')
@@ -328,7 +330,7 @@ def dashboard():
         # Handle the case where user_id is not in session
         flash('Session expired. Please log in again.')
         return redirect(url_for('login'))
-    
+
     user = db.session.get(User, user_id)
     if not user:
         flash('User not found.')
@@ -336,7 +338,6 @@ def dashboard():
 
     risk_score = session.get('risk_score', 'N/A')
     return render_template('dashboard.html', username=user.username, risk_score=risk_score)
-
 
 @app.route('/verify_identity', methods=['GET', 'POST'])
 def verify_identity():
@@ -417,23 +418,28 @@ def verify_identity():
             return 'User not found.', 404
 
         return render_template('verify_identity.html')
-    
+
 def get_user_typical_hours(user_id):
-    # Fetch login attempts for the user
+    # Fetch legitimate login attempts for the user
     attempts = LoginAttempt.query.filter_by(user_id=user_id, label=0).all()
     if not attempts:
         return list(range(24))  # If no data, assume all hours are typical
 
-    # Collect login hours
+    # Collect login hours and their frequencies
     hours = [attempt.login_hour for attempt in attempts]
-    # Determine typical hours (e.g., hours with more than one login)
     from collections import Counter
     hour_counts = Counter(hours)
-    typical_hours = [hour for hour, count in hour_counts.items() if count > 1]
-    if not typical_hours:
-        typical_hours = hours  # If no hour occurs more than once, consider all logged hours as typical
-    return typical_hours
 
+    # Calculate the average frequency
+    avg_frequency = sum(hour_counts.values()) / len(hour_counts) if hour_counts else 0
+
+    # Consider an hour "typical" if it occurs at least 25% of the average frequency
+    typical_hours = [hour for hour, count in hour_counts.items() if count >= 0.25 * avg_frequency]
+
+    if not typical_hours:
+        typical_hours = hours  # If no hour meets the threshold, use all observed hours
+
+    return typical_hours
 
 def label_attempt(user_id, ip_address, user_agent, country, region, city):
     previous_attempts = LoginAttempt.query.filter_by(user_id=user_id, label=0).all()
@@ -463,246 +469,281 @@ def label_attempt(user_id, ip_address, user_agent, country, region, city):
     else:
         return 0  # Legitimate
 
-
 def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, user):
-    global model
-    global encoder_ip
-    global encoder_agent
-    global encoder_country
-    global encoder_region
-    global encoder_city
+    global model, encoder_ip, encoder_agent, encoder_country, encoder_region, encoder_city, model_features
 
-    # Encode input data
-    if ip_address in encoder_ip.classes_:
-        ip_encoded = encoder_ip.transform([ip_address])[0]
-    else:
-        ip_encoded = -1  # Use -1 for unknown IPs
+    if model is None:
+        # If no model exists, consider it medium risk
+        return 0.5
 
-    if user_agent in encoder_agent.classes_:
-        agent_encoded = encoder_agent.transform([user_agent])[0]
-    else:
-        agent_encoded = -1  # Use -1 for unknown agents
-
-    if country in encoder_country.classes_:
-        country_encoded = encoder_country.transform([country])[0]
-    else:
-        country_encoded = -1
-
-    if region in encoder_region.classes_:
-        region_encoded = encoder_region.transform([region])[0]
-    else:
-        region_encoded = -1
-
-    if city in encoder_city.classes_:
-        city_encoded = encoder_city.transform([city])[0]
-    else:
-        city_encoded = -1
-
-    # Determine if login time is within typical hours
-    typical_hours = get_user_typical_hours(user.id)
-    time_anomaly = 1 if login_time.hour not in typical_hours else 0
-
-    # Calculate the number of recent failed attempts (e.g., in the last hour)
-    recent_failed_attempts = LoginAttempt.query.filter_by(
+    # Calculate recent attempts
+    recent_attempts = LoginAttempt.query.filter_by(
         user_id=user.id,
-        label=1  # Assuming label 1 indicates a failed attempt
     ).filter(
-        LoginAttempt.login_time >= datetime.datetime.now() - datetime.timedelta(hours=1)
-    ).count()
+        LoginAttempt.login_time >= login_time - datetime.timedelta(hours=24)
+    ).all()
+    failed_attempts_24h = sum(1 for a in recent_attempts if a.label == 1)
+    unique_ips_24h = len(set(a.ip_address for a in recent_attempts))
+    unique_locations_24h = len(set((a.country, a.region, a.city) for a in recent_attempts))
 
+    # Get user's typical hours
+    typical_hours = get_user_typical_hours(user.id)
+    is_typical_hour = 1 if login_time.hour in typical_hours else 0
+    time_anomaly = 1 - is_typical_hour
+
+    # Trusted locations
+    trusted_countries = [tl.country for tl in user.trusted_locations]
+    trusted_regions = [tl.region for tl in user.trusted_locations]
+    trusted_cities = [tl.city for tl in user.trusted_locations]
+
+    is_trusted_country = 1 if country in trusted_countries else 0
+    is_trusted_region = 1 if region in trusted_regions else 0
+    is_trusted_city = 1 if city in trusted_cities else 0
+
+    # Encoding features
+    def safe_encode(encoder, value):
+        try:
+            if value in encoder.classes_:
+                return encoder.transform([value])[0]
+            else:
+                return -1  # Assign -1 to unseen categories
+        except (ValueError, AttributeError):
+            return -1
+
+    ip_address_encoded = safe_encode(encoder_ip, ip_address)
+    user_agent_encoded = safe_encode(encoder_agent, user_agent)
+    country_encoded = safe_encode(encoder_country, country)
+    region_encoded = safe_encode(encoder_region, region)
+    city_encoded = safe_encode(encoder_city, city)
+
+    # Prepare input data
     input_data = pd.DataFrame({
-        'ip_encoded': [ip_encoded],
-        'agent_encoded': [agent_encoded],
-        'login_time': [login_time.hour],
-        'login_day': [login_time.weekday()],
+        'ip_address_encoded': [ip_address_encoded],
+        'user_agent_encoded': [user_agent_encoded],
+        'hour': [login_time.hour],
+        'day_of_week': [login_time.weekday()],
+        'is_typical_hour': [is_typical_hour],
         'country_encoded': [country_encoded],
         'region_encoded': [region_encoded],
         'city_encoded': [city_encoded],
         'failed_attempts': [user.failed_attempts],
-        'recent_failed_attempts': [recent_failed_attempts],
+        'attempts_24h': [len(recent_attempts)],
+        'failed_attempts_24h': [failed_attempts_24h],
+        'unique_ips_24h': [unique_ips_24h],
+        'unique_locations_24h': [unique_locations_24h],
+        'is_trusted_country': [is_trusted_country],
+        'is_trusted_region': [is_trusted_region],
+        'is_trusted_city': [is_trusted_city],
         'time_anomaly': [time_anomaly],
     })
 
-    # Get prediction probabilities
-    risk_probs = model.predict_proba(input_data)[0]
-    # Get the classes from the model
-    classes = model.classes_
+    # Ensure columns match model features
+    try:
+        input_data = input_data[model_features]
+    except KeyError as e:
+        missing_features = set(model_features) - set(input_data.columns)
+        logger.error(f"Missing features in input data: {missing_features}")
+        return 0.5  # Default risk score on error
 
-    # Handle the case where only one class is predicted
-    if len(classes) == 1:
-        if classes[0] == 0:
-            risk_score = 0.0  # Model predicts only legitimate
-        else:
-            risk_score = 1.0  # Model predicts only anomalous
-    else:
-        # Get the index of the anomalous class (label 1)
-        anomalous_index = list(classes).index(1)
+    # Make prediction
+    try:
+        risk_probs = model.predict_proba(input_data)[0]
+        anomalous_index = list(model.classes_).index(1)
         risk_score = risk_probs[anomalous_index]
+    except Exception as e:
+        logger.error(f"Error in risk assessment: {e}")
+        risk_score = 0.5
 
-    return risk_score  # Risk score between 0 and 1
+    return risk_score
 
 def prepare_and_train_model():
-    global model
-    global encoder_ip
-    global encoder_agent
-    global encoder_country
-    global encoder_region
-    global encoder_city
+    global model, model_features
 
     # Fetch login attempts
     attempts = LoginAttempt.query.all()
     data = []
 
     for attempt in attempts:
-        # Get user to access failed_attempts
         user = User.query.filter_by(id=attempt.user_id).first()
         if not user:
             continue
 
-        # Determine time anomaly
-        typical_hours = get_user_typical_hours(user.id)
-        time_anomaly = 1 if attempt.login_hour not in typical_hours else 0
+        # Enhanced feature engineering
+        login_datetime = attempt.login_time
 
-        # Calculate recent_failed_attempts (e.g., in the last hour before this attempt)
-        time_threshold = attempt.login_time - datetime.timedelta(hours=1)
-        recent_failed = LoginAttempt.query.filter(
+        # Get user's typical hours
+        typical_hours = get_user_typical_hours(user.id)
+        is_typical_hour = 1 if login_datetime.hour in typical_hours else 0
+
+        # Calculate velocity features
+        time_window = login_datetime - datetime.timedelta(hours=24)
+        recent_attempts = LoginAttempt.query.filter(
             LoginAttempt.user_id == user.id,
-            LoginAttempt.login_time >= time_threshold,
-            LoginAttempt.label == 1  # Assuming label=1 indicates a failed attempt
-        ).count()
+            LoginAttempt.login_time >= time_window
+        ).all()
+
+        velocity_features = {
+            'attempts_24h': len(recent_attempts),
+            'failed_attempts_24h': sum(1 for a in recent_attempts if a.label == 1),
+            'unique_ips_24h': len(set(a.ip_address for a in recent_attempts)),
+            'unique_locations_24h': len(set((a.country, a.region, a.city) for a in recent_attempts))
+        }
+
+        # Location risk features
+        trusted_locations = TrustedLocation.query.filter_by(user_id=user.id).all()
+        location_features = {
+            'is_trusted_country': 1 if any(tl.country == attempt.country for tl in trusted_locations) else 0,
+            'is_trusted_region': 1 if any(tl.region == attempt.region for tl in trusted_locations) else 0,
+            'is_trusted_city': 1 if any(tl.city == attempt.city for tl in trusted_locations) else 0,
+        }
 
         attempt_data = {
             'user_id': attempt.user_id,
             'ip_address': attempt.ip_address,
             'user_agent': attempt.user_agent,
-            'login_time': attempt.login_hour,
-            'login_day': attempt.login_day,
+            'hour': login_datetime.hour,
+            'day_of_week': login_datetime.weekday(),
+            'is_typical_hour': is_typical_hour,
             'country': attempt.country if attempt.country else 'Unknown',
             'region': attempt.region if attempt.region else 'Unknown',
             'city': attempt.city if attempt.city else 'Unknown',
             'failed_attempts': user.failed_attempts,
-            'recent_failed_attempts': recent_failed,
-            'time_anomaly': time_anomaly,
+            **velocity_features,
+            **location_features,
+            'time_anomaly': 1 - is_typical_hour,
             'label': attempt.label
         }
         data.append(attempt_data)
 
-    # **Add this block to handle empty data**
-    if not data:
-        # Create dummy data for demonstration purposes
-        data = [
-            {
-                'user_id': 1,
-                'ip_address': '127.0.0.1',
-                'user_agent': 'dummy_agent',
-                'login_time': 12,
-                'login_day': 0,
-                'country': 'CountryA',
-                'region': 'RegionA',
-                'city': 'CityA',
-                'failed_attempts': 0,
-                'recent_failed_attempts': 0,
-                'time_anomaly': 0,
-                'label': 0
-            },
-            {
-                'user_id': 1,
-                'ip_address': 'unknown_ip',
-                'user_agent': 'dummy_agent',
-                'login_time': 12,
-                'login_day': 0,
-                'country': 'CountryB',
-                'region': 'RegionB',
-                'city': 'CityB',
-                'failed_attempts': 3,
-                'recent_failed_attempts': 1,
-                'time_anomaly': 1,
-                'label': 1
-            }
-        ]
+    # Add synthetic data for initial training
+    synthetic_data = [
+        # Legitimate login patterns
+        {
+            'user_id': 0,
+            'ip_address': '127.0.0.1',
+            'user_agent': 'common_browser',
+            'hour': 14,
+            'day_of_week': 2,
+            'is_typical_hour': 1,
+            'country': 'CountryA',
+            'region': 'RegionA',
+            'city': 'CityA',
+            'failed_attempts': 0,
+            'attempts_24h': 1,
+            'failed_attempts_24h': 0,
+            'unique_ips_24h': 1,
+            'unique_locations_24h': 1,
+            'is_trusted_country': 1,
+            'is_trusted_region': 1,
+            'is_trusted_city': 1,
+            'time_anomaly': 0,
+            'label': 0
+        },
+        # Suspicious login patterns
+        {
+            'user_id': 0,
+            'ip_address': 'suspicious_ip',
+            'user_agent': 'unusual_agent',
+            'hour': 3,
+            'day_of_week': 6,
+            'is_typical_hour': 0,
+            'country': 'CountryB',
+            'region': 'RegionB',
+            'city': 'CityB',
+            'failed_attempts': 3,
+            'attempts_24h': 10,
+            'failed_attempts_24h': 5,
+            'unique_ips_24h': 4,
+            'unique_locations_24h': 3,
+            'is_trusted_country': 0,
+            'is_trusted_region': 0,
+            'is_trusted_city': 0,
+            'time_anomaly': 1,
+            'label': 1
+        }
+    ]
+
+    # Add synthetic data if real data is insufficient
+    if len(data) < 2:
+        data.extend(synthetic_data)
+    else:
+        # Check if we have both classes represented
+        labels = set(d['label'] for d in data)
+        if len(labels) < 2:
+            data.extend(synthetic_data)
 
     # Convert to DataFrame
     df = pd.DataFrame(data)
 
-    # Ensure both classes have at least two samples
-    class_counts = df['label'].value_counts().to_dict()
+    # Enhanced feature encoding
+    categorical_features = ['ip_address', 'user_agent', 'country', 'region', 'city']
+    for feature in categorical_features:
+        encoder = LabelEncoder()
+        df[f'{feature}_encoded'] = encoder.fit_transform(df[feature])
+        globals()[f'encoder_{feature.split("_")[0]}'] = encoder
 
-    for label in [0, 1]:
-        if class_counts.get(label, 0) < 2:
-            # Generate synthetic data to augment the class
-            samples_needed = 2 - class_counts.get(label, 0)
-            for _ in range(samples_needed):
-                synthetic_sample = pd.DataFrame([{
-                    'user_id': 1,
-                    'ip_address': '127.0.0.1' if label == 0 else 'unknown_ip',
-                    'user_agent': 'dummy_agent',
-                    'login_time': 12,
-                    'login_day': 0,
-                    'country': 'CountryA' if label == 0 else 'CountryB',
-                    'region': 'RegionA' if label == 0 else 'RegionB',
-                    'city': 'CityA' if label == 0 else 'CityB',
-                    'failed_attempts': 0 if label == 0 else 3,
-                    'recent_failed_attempts': 0 if label == 0 else 1,
-                    'time_anomaly': 0 if label == 0 else 1,
-                    'label': label
-                }])
-                df = pd.concat([df, synthetic_sample], ignore_index=True)
+    # Feature selection
+    features = [
+        'ip_address_encoded',
+        'user_agent_encoded',
+        'hour',
+        'day_of_week',
+        'is_typical_hour',
+        'country_encoded',
+        'region_encoded',
+        'city_encoded',
+        'failed_attempts',
+        'attempts_24h',
+        'failed_attempts_24h',
+        'unique_ips_24h',
+        'unique_locations_24h',
+        'is_trusted_country',
+        'is_trusted_region',
+        'is_trusted_city',
+        'time_anomaly'
+    ]
 
-    # Encode categorical variables
-    encoder_ip = LabelEncoder()
-    encoder_agent = LabelEncoder()
-    encoder_country = LabelEncoder()
-    encoder_region = LabelEncoder()
-    encoder_city = LabelEncoder()
-
-    df['ip_encoded'] = encoder_ip.fit_transform(df['ip_address'])
-    df['agent_encoded'] = encoder_agent.fit_transform(df['user_agent'])
-    df['country_encoded'] = encoder_country.fit_transform(df['country'])
-    df['region_encoded'] = encoder_region.fit_transform(df['region'])
-    df['city_encoded'] = encoder_city.fit_transform(df['city'])
-
-    # Features and Labels
-    X = df[['ip_encoded', 'agent_encoded', 'login_time', 'login_day', 'country_encoded',
-            'region_encoded', 'city_encoded', 'failed_attempts', 'recent_failed_attempts', 'time_anomaly']]
+    X = df[features]
     y = df['label']
 
-    n_samples = len(df)
-    n_classes = y.nunique()
-
-    # Calculate minimum test size to ensure at least one sample per class
-    min_test_size = n_classes / n_samples
-
-    # Ensure test_size is at least the minimum required and not more than 0.5
-    test_size = max(min_test_size, 0.2)
-    test_size = min(test_size, 0.5)
-
-    # Adjust n_splits to 1 since the dataset is small
-    sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=42)
-    try:
-        for train_index, test_index in sss.split(X, y):
-            X_train, X_test = X.iloc[train_index], X.iloc[test_index]
-            y_train, y_test = y.iloc[train_index], y.iloc[test_index]
-    except ValueError as e:
-        print(f"Warning: {e}")
-        # If splitting fails, use the entire dataset for training and testing
-        X_train, X_test = X, X
-        y_train, y_test = y, y
-
     # Train the model
-    model = RandomForestClassifier(n_estimators=100, random_state=42)
-    model.fit(X_train, y_train)
+    model = GradientBoostingClassifier(
+        n_estimators=100,
+        learning_rate=0.1,
+        max_depth=3,
+        random_state=42
+    )
 
-    # Evaluate the model
-    if len(y_test) > 0:
-        accuracy = model.score(X_test, y_test)
-        print(f"Model accuracy: {accuracy}")
-    else:
-        print("Not enough data to evaluate model accuracy.")
+    try:
+        model.fit(X, y)
 
-# Create the database and tables
-with app.app_context():
-    db.create_all()
-    prepare_and_train_model()
+        # Print feature importance once
+        feature_importance = pd.DataFrame({
+            'feature': features,
+            'importance': model.feature_importances_
+        }).sort_values('importance', ascending=False)
+        print("\nFeature Importance:")
+        print(feature_importance)
+    except Exception as e:
+        logger.error(f"Error training model: {e}")
+        # Initialize a basic model with synthetic data only
+        X = pd.DataFrame([synthetic_data[0], synthetic_data[1]])[features]
+        y = pd.Series([0, 1])
+        model.fit(X, y)
+
+    # Save the list of features used during training
+    global model_features
+    model_features = features
+
+def init_model():
+    """Initialize the model once at startup"""
+    with app.app_context():
+        db.create_all()
+        logger.info("Training initial model...")
+        prepare_and_train_model()
 
 if __name__ == '__main__':
+    if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+        # Only initialize when the reloader is active
+        init_model()
     app.run(debug=True, host='0.0.0.0', port=5000)
