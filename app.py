@@ -1,5 +1,5 @@
 from flask import Flask, render_template, redirect, url_for, request, session, flash
-from models import db, User, LoginAttempt, TrustedLocation
+from models import db, User, LoginAttempt, TrustedLocation, TrustedDevice
 from werkzeug.security import generate_password_hash, check_password_hash
 import datetime
 from random import randint
@@ -600,11 +600,21 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
         user_id=user.id
     ).order_by(LoginAttempt.login_time.desc()).first()
     
+    # Check for device trust
+    trusted_device = TrustedDevice.query.filter_by(
+        user_id=user.id,
+        user_agent=user_agent
+    ).first()
+    
     # Check for device change
     device_change_risk = 0.0
     if previous_attempt and previous_attempt.user_agent != user_agent:
         logger.info("New device detected")
-        device_change_risk = 0.3  # Add significant risk for new device
+        if not trusted_device:
+            device_change_risk = 0.3  # This will be used as an adjustment factor
+            logger.info("Device is not trusted")
+        else:
+            logger.info("Device is trusted")
     
     # Calculate travel risk if previous attempt exists
     travel_risk = 0.0
@@ -705,14 +715,15 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
         anomalous_index = list(model.classes_).index(1)
         base_risk_score = risk_probs[anomalous_index]
         
-        # Add device change risk to base score
-        base_risk_score = max(base_risk_score, device_change_risk)
-        
+        # Apply device change risk as an adjustment
+        if device_change_risk > 0:
+            # Use device change as a multiplier and offset
+            risk_score = base_risk_score * (1 + device_change_risk) + (device_change_risk * 0.2)
+        else:
+            risk_score = base_risk_score
+
         # Calculate failed attempts factor
         failed_attempts_factor = min(user.failed_attempts / 4.0, 1.0)
-
-        # Start with base risk score
-        risk_score = base_risk_score
 
         # Adjust based on location trust
         if location_trust == 0:  # Completely untrusted location
@@ -721,7 +732,7 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
             # Add base risk for partially trusted locations
             base_untrusted_risk = 0.2  # Base risk for untrusted elements
             untrusted_factor = 1.0 - location_trust
-            adjustment = (untrusted_factor * 0.3 * (1 + base_risk_score)) + base_untrusted_risk
+            adjustment = (untrusted_factor * 0.3 * (1 + risk_score)) + base_untrusted_risk
             risk_score = risk_score + adjustment
         else:  # Fully trusted location
             risk_score *= 0.5

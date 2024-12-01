@@ -1,4 +1,5 @@
 from flask_sqlalchemy import SQLAlchemy
+import datetime
 
 db = SQLAlchemy()
 
@@ -34,3 +35,10 @@ class LoginAttempt(db.Model):
     city = db.Column(db.String(100))
     login_day = db.Column(db.Integer)  # 0 = Monday, 6 = Sunday
     login_hour = db.Column(db.Integer)
+
+class TrustedDevice(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    user_agent = db.Column(db.String(500), nullable=False)
+    added_time = db.Column(db.DateTime, default=datetime.datetime.now)
+    user = db.relationship('User', backref=db.backref('trusted_devices', lazy=True))

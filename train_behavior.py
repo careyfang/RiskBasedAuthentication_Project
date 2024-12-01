@@ -61,18 +61,22 @@ class BehaviorTester:
         login_data = {
             'username': self.username,
             'password': self.password,
-            'simulated_time': self.current_time.isoformat()
+            'simulated_time': self.current_time.isoformat(),
+            'user_agent': self.user_agents[self.usual_device]  # Add user agent to form data
         }
         
-        # Set user agent if specified
-        if hasattr(self, 'usual_device'):
-            self.session.headers.update({'User-Agent': self.user_agents[self.usual_device]})
+        # Set user agent in headers
+        headers = {
+            'User-Agent': self.user_agents[self.usual_device]
+        }
         
         response = self.session.post(
             f'{self.base_url}/login',
-            data=login_data
+            data=login_data,
+            headers=headers
         )
-        print(f"Login at {self.current_time.strftime('%Y-%m-%d %H:%M')} - Response URL: {response.url}")
+        print(f"Login at {self.current_time.strftime('%Y-%m-%d %H:%M')} with device: {self.usual_device}")
+        print(f"Response URL: {response.url}")
 
         # Handle security question if needed
         if 'security_question' in response.url:
@@ -242,12 +246,13 @@ class BehaviorTester:
         self.set_location(self.usual_location)
         self.login()
 
-    def set_user_agent(self, device_key):
-        """Set the user agent for the session"""
-        if device_key in self.user_agents:
-            self.session.headers.update({'User-Agent': self.user_agents[device_key]})
+    def set_user_agent(self, device_type):
+        """Set the user agent for subsequent requests"""
+        if device_type in self.user_agents:
+            self.usual_device = device_type
+            print(f"Changed device to: {device_type}")
         else:
-            print(f"Unknown device: {device_key}")
+            print(f"Unknown device type: {device_type}")
 
     def test_location_trust_levels(self):
         """Test different levels of location trust"""
