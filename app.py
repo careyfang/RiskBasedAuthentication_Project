@@ -367,7 +367,7 @@ def login():
             user.failed_attempts = 0
             db.session.commit()
 
-            if risk_score < 0.3:
+            if risk_score < 0.31:
                 session['user_id'] = user.id
                 return redirect(url_for('dashboard'))
             elif risk_score < 0.6:

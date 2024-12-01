@@ -54,16 +54,19 @@ class BehaviorTester:
         self.current_time = self.current_time.replace(hour=9, minute=0)
 
     def login(self):
-        # Add time increment between logins (e.g., 1 hour)
-        if hasattr(self, 'last_login_time'):
-            self.current_time = self.last_login_time + datetime.timedelta(hours=1)
+        # Store last login time without modifying current_time
         self.last_login_time = self.current_time
         
+        # Prepare login data with simulated time
         login_data = {
             'username': self.username,
             'password': self.password,
             'simulated_time': self.current_time.isoformat()
         }
+        
+        # Set user agent if specified
+        if hasattr(self, 'usual_device'):
+            self.session.headers.update({'User-Agent': self.user_agents[self.usual_device]})
         
         response = self.session.post(
             f'{self.base_url}/login',
