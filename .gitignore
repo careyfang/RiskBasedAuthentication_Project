@@ -26,3 +26,6 @@ instance/
 .idea/
 *.sublime-project
 *.sublime-workspace
+
+# Specific files
+*.joblib
