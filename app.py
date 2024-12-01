@@ -18,6 +18,9 @@ import random
 from apscheduler.schedulers.background import BackgroundScheduler
 from sklearn.ensemble import IsolationForest
 import joblib
+from geopy.distance import geodesic
+from geopy.geocoders import Nominatim
+from config.test_locations import get_cached_coords, LOCATION_CACHE
 
 app = Flask(__name__)
 app.secret_key = 'your_secret_key'  # Replace with a secure key
@@ -45,6 +48,17 @@ encoder_city = LabelEncoder()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def safe_encode(encoder, value):
+    """Safely encode values, handling unknown categories"""
+    try:
+        return encoder.transform([value])[0]
+    except:
+        # Return the encoded value for 'Unknown' or 0 if that fails
+        try:
+            return encoder.transform(['Unknown'])[0]
+        except:
+            return 0
 
 @app.route('/')
 def index():
@@ -166,59 +180,59 @@ def register():
 
 @app.route('/security_question', methods=['GET', 'POST'])
 def security_question():
-    user_id = session.get('user_id')
-    if not user_id:
-        return 'Session expired. Please log in again.', 401
-
-    user = User.query.get_or_404(user_id)
-    if not user:
-        return 'User not found.', 404
-
     if request.method == 'POST':
-        answer = request.form.get('security_answer')
-        add_to_trusted = request.form.get('add_to_trusted', 'false').lower() == 'true'
-        
-        if check_password_hash(user.security_answer, answer):
+        user_id = session.get('user_id')
+        if not user_id:
+            return redirect(url_for('login'))
+
+        user = db.session.get(User, user_id)
+        if not user:
+            return redirect(url_for('login'))
+
+        entered_answer = request.form.get('security_answer')
+        if entered_answer and entered_answer.lower() == user.security_answer.lower():
+            # Mark the latest attempt as legitimate
             login_attempt = LoginAttempt.query.filter_by(user_id=user_id).order_by(LoginAttempt.id.desc()).first()
             if login_attempt:
-                login_attempt.label = 0  # Mark as legitimate
-                
-                # Only add to trusted locations if explicitly requested
-                if add_to_trusted:
-                    if (login_attempt.country not in ['Unknown', 'None'] and 
-                        login_attempt.region not in ['Unknown', 'None'] and 
-                        login_attempt.city not in ['Unknown', 'None']):
-                        
-                        existing_location = TrustedLocation.query.filter_by(
-                            user_id=user_id,
-                            country=login_attempt.country,
-                            region=login_attempt.region,
-                            city=login_attempt.city
-                        ).first()
-
-                        if not existing_location:
-                            print(f"Adding trusted location: {login_attempt.country}, {login_attempt.region}, {login_attempt.city}")
-                            new_location = TrustedLocation(
-                                user_id=user_id,
-                                country=login_attempt.country,
-                                region=login_attempt.region,
-                                city=login_attempt.city
-                            )
-                            db.session.add(new_location)
-                
+                login_attempt.label = 0
+                add_to_trusted_locations(user_id, login_attempt)
                 db.session.commit()
+                prepare_and_train_model()
 
-            # Retrain the model with updated data
-            prepare_and_train_model()
-
-            # Log the user in
-            session['user_id'] = user_id
             return redirect(url_for('dashboard'))
         else:
-            flash('Incorrect answer. Please try again.')
-            return render_template('security_question.html', question=user.security_question)
-    else:
-        return render_template('security_question.html', question=user.security_question)
+            flash('Incorrect answer. Please try again.', 'error')
+            return render_template('security_question.html')
+
+    return render_template('security_question.html')
+
+def add_to_trusted_locations(user_id, login_attempt):
+    """Add location to trusted locations after successful verification"""
+    # Trust location after successful verification unless it's a test
+    is_test = session.get('is_test_mode', False)
+    should_trust = not is_test  # Trust unless explicitly in test mode
+    
+    if should_trust and all(x not in ['Unknown', 'None'] 
+                          for x in [login_attempt.country, 
+                                  login_attempt.region, 
+                                  login_attempt.city]):
+        
+        existing_location = TrustedLocation.query.filter_by(
+            user_id=user_id,
+            country=login_attempt.country,
+            region=login_attempt.region,
+            city=login_attempt.city
+        ).first()
+
+        if not existing_location:
+            print(f"Adding trusted location: {login_attempt.country}, {login_attempt.region}, {login_attempt.city}")
+            new_location = TrustedLocation(
+                user_id=user_id,
+                country=login_attempt.country,
+                region=login_attempt.region,
+                city=login_attempt.city
+            )
+            db.session.add(new_location)
 
 def get_client_ip():
     # For testing: check if there's a test IP in session
@@ -258,6 +272,7 @@ def login():
     if request.method == 'POST':
         username = request.form['username']
         password = request.form['password']
+        user_agent = request.form.get('user_agent', request.headers.get('User-Agent', ''))
         user = User.query.filter_by(username=username).first()
 
         if user:
@@ -270,12 +285,10 @@ def login():
                 return render_template('login.html', show_unlock=True, username=username)
 
             if not check_password_hash(user.password, password):
-                # Incorrect password
                 user.failed_attempts += 1
                 db.session.commit()
                 print(f"Failed attempts for user {user.username}: {user.failed_attempts}")
 
-                # Lock account after too many failed attempts
                 MAX_FAILED_ATTEMPTS = 5
                 if user.failed_attempts >= MAX_FAILED_ATTEMPTS:
                     user.is_locked = True
@@ -286,56 +299,71 @@ def login():
                 flash('Invalid credentials')
                 return render_template('login.html')
 
-            # Collect contextual data for risk assessment
+            # Get contextual data
             ip_address = get_client_ip()
-            user_agent = request.headers.get('User-Agent')
-            login_time = datetime.datetime.fromisoformat(request.form.get('simulated_time')) \
-                if request.form.get('simulated_time') \
-                else datetime.datetime.now()
-            login_hour = login_time.hour
-            login_day = login_time.weekday()
             country, region, city = get_geolocation(ip_address)
 
-            # Add this line to define recent_attempts
-            recent_attempts = LoginAttempt.query.filter_by(user_id=user.id).filter(
-                LoginAttempt.login_time >= login_time - datetime.timedelta(hours=24)
-            ).all()
+            # Use simulated time if provided, otherwise use current time
+            current_time = (
+                datetime.datetime.fromisoformat(request.form['simulated_time'])
+                if 'simulated_time' in request.form
+                else datetime.datetime.now()
+            )
 
-            # Perform risk assessment before resetting failed attempts
-            risk_score = assess_risk_ml(ip_address, user_agent, login_time, country, region, city, user)
+            # Get previous login attempt for time difference
+            prev_attempt = LoginAttempt.query.filter_by(user_id=user.id).order_by(LoginAttempt.login_time.desc()).first()
+            
+            # Calculate time difference and get previous location
+            time_diff_hours = 0.0
+            prev_location = None
+            if prev_attempt:
+                time_diff_hours = (current_time - prev_attempt.login_time).total_seconds() / 3600
+                prev_location = {
+                    'city': prev_attempt.city,
+                    'region': prev_attempt.region,
+                    'country': prev_attempt.country
+                }
+                print(f"Time difference between logins: {time_diff_hours:.2f} hours")
+
+            # Current location
+            current_location = {
+                'city': city,
+                'region': region,
+                'country': country
+            }
+
+            # Perform risk assessment with location and time data
+            risk_score = assess_risk_ml(
+                ip_address, 
+                user_agent, 
+                current_time, 
+                country, 
+                region, 
+                city, 
+                user,
+                prev_location=prev_location,
+                current_location=current_location,
+                time_diff_hours=time_diff_hours
+            )
             print(f"Risk score for user {user.username}: {risk_score}")
             session['risk_score'] = risk_score
 
-            # Get trusted locations
-            trusted_locations = TrustedLocation.query.filter_by(user_id=user.id).all()
-            trusted_countries = set(loc.country for loc in trusted_locations)
-            trusted_regions = set(loc.region for loc in trusted_locations)
-            trusted_cities = set(loc.city for loc in trusted_locations)
-
-            # Add logging for location data
-            print(f"\nLogin attempt details:")
-            print(f"IP: {ip_address}")
-            print(f"Location: {country}, {region}, {city}")
-            print(f"Previous trusted locations: {trusted_countries}")
-            print(f"Previous login locations: {[f'{a.country}, {a.region}, {a.city}' for a in recent_attempts]}")
-
-            # Store login attempt
+            # Store login attempt with simulated time
             login_attempt = LoginAttempt(
                 user_id=user.id,
                 ip_address=ip_address,
                 user_agent=user_agent,
-                login_time=login_time,
-                login_hour=login_hour,
-                login_day=login_day,
+                login_time=current_time,
+                login_hour=current_time.hour,
+                login_day=current_time.weekday(),
                 country=country if country else 'Unknown',
                 region=region if region else 'Unknown',
                 city=city if city else 'Unknown',
                 label=label_attempt(user.id, ip_address, user_agent, country, region, city)
             )
             db.session.add(login_attempt)
-            db.session.commit()  # Commit immediately to ensure the attempt is recorded
+            db.session.commit()
 
-            # Reset failed attempts only after risk assessment
             user.failed_attempts = 0
             db.session.commit()
 
@@ -373,22 +401,30 @@ def dashboard():
 @app.route('/verify_identity', methods=['GET', 'POST'])
 def verify_identity():
     if request.method == 'POST':
-        # Get the OTP code entered by the user
         entered_otp = request.form.get('otp')
         if 'otp' in session and entered_otp == session['otp']:
-            # Verification successful
             user_id = session.get('user_id')
             if user_id:
-                # Mark the current attempt as legitimate
+                user = db.session.get(User, user_id)
                 login_attempt = LoginAttempt.query.filter_by(user_id=user_id).order_by(LoginAttempt.id.desc()).first()
+                
                 if login_attempt:
                     login_attempt.label = 0  # Mark as legitimate
-                    db.session.commit()
-
-                    # Add new trusted location if not already trusted and not unknown
-                    if (login_attempt.country not in ['Unknown', 'None'] and 
-                        login_attempt.region not in ['Unknown', 'None'] and 
-                        login_attempt.city not in ['Unknown', 'None']):
+                    
+                    # Check if this is one of the user's first logins
+                    login_count = LoginAttempt.query.filter_by(
+                        user_id=user_id,
+                        label=0
+                    ).count()
+                    
+                    # Trust location after successful verification unless it's a test
+                    is_test = session.get('is_test_mode', False)
+                    should_trust = not is_test  # Trust unless explicitly in test mode
+                    
+                    if should_trust and all(x not in ['Unknown', 'None'] 
+                                          for x in [login_attempt.country, 
+                                                  login_attempt.region, 
+                                                  login_attempt.city]):
                         
                         existing_location = TrustedLocation.query.filter_by(
                             user_id=user_id,
@@ -406,32 +442,20 @@ def verify_identity():
                                 city=login_attempt.city
                             )
                             db.session.add(new_location)
-                        
+                    
                     db.session.commit()
+                    prepare_and_train_model()
 
-                # Retrain the model with updated data
-                prepare_and_train_model()
-
-                # Log the user in
+                # Complete login
                 session['user_id'] = user_id
-                # Remove OTP from session
                 session.pop('otp', None)
                 session.pop('otp_generated_at', None)
                 session.pop('otp_attempts', None)
+                session.pop('is_business_trip', None)
+                session.pop('is_initial_training', None)
+                session.pop('is_test_mode', None)
 
                 return redirect(url_for('dashboard'))
-            else:
-                return 'Session expired. Please log in again.', 401
-        else:
-            # Verification failed
-            session['otp_attempts'] = session.get('otp_attempts', 0) + 1
-            if session['otp_attempts'] >= 3:
-                # Too many failed attempts
-                session.pop('otp', None)
-                session.pop('otp_generated_at', None)
-                session.pop('otp_attempts', None)
-                return 'Too many failed attempts. Please log in again.', 401
-            return 'Verification failed', 401
     else:
         # Generate an OTP code and store it in the session
         otp_code = str(randint(100000, 999999))
@@ -507,12 +531,117 @@ def label_attempt(user_id, ip_address, user_agent, country, region, city):
 
     return 0  # Mark as legitimate
 
-def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, user):
-    global model, encoder_ip, encoder_agent, encoder_country, encoder_region, encoder_city, model_features
+def calculate_travel_risk(previous_location, current_location, time_difference_hours):
+    try:
+        # Skip for invalid locations
+        if any(x in ['Local', 'Unknown', 'None'] 
+               for loc in [previous_location, current_location] 
+               for x in loc.values()):
+            return 0.0, {"error": "Local or unknown locations - skipping travel calculation"}
+            
+        # Get coordinates and calculate distance
+        coords1 = get_cached_coords(previous_location['city'], previous_location['region'], previous_location['country'])
+        coords2 = get_cached_coords(current_location['city'], current_location['region'], current_location['country'])
+        distance = geodesic(coords1, coords2).miles
+        
+        # Minimum time threshold (1 minute = 0.016667 hours)
+        MIN_TIME = 0.016667
+        
+        # If time difference is too small but locations differ
+        if time_difference_hours < MIN_TIME and distance > 0:
+            required_speed = distance / MIN_TIME  # Use minimum time to avoid infinity
+            return 1.0, {
+                "from_location": f"{previous_location['city']}, {previous_location['region']}",
+                "to_location": f"{current_location['city']}, {current_location['region']}",
+                "distance_miles": round(distance, 2),
+                "time_hours": round(time_difference_hours, 3),
+                "required_speed_mph": round(required_speed, 2),
+                "assessment": f"Suspicious: {distance:.1f} miles traveled in less than a minute"
+            }
+        
+        # Normal speed calculation
+        required_speed = distance / max(time_difference_hours, MIN_TIME)
+        
+        # Travel assessment
+        travel_details = {
+            "from_location": f"{previous_location['city']}, {previous_location['region']}",
+            "to_location": f"{current_location['city']}, {current_location['region']}",
+            "from_coords": f"({coords1[0]}, {coords1[1]})",
+            "to_coords": f"({coords2[0]}, {coords2[1]})",
+            "distance_miles": round(distance, 2),
+            "time_hours": round(time_difference_hours, 2),
+            "required_speed_mph": round(required_speed, 2)
+        }
+        
+        # Risk assessment
+        if required_speed > 600:  # Impossible travel
+            risk_score = 1.0
+            travel_details["assessment"] = "Impossible travel detected"
+        elif required_speed > 550:  # Suspicious but possible
+            risk_score = 0.7
+            travel_details["assessment"] = "Suspicious travel speed"
+        elif distance > 100:  # Long distance but reasonable speed
+            risk_score = 0.3
+            travel_details["assessment"] = "Long distance but feasible"
+        else:  # Short distance
+            risk_score = 0.0
+            travel_details["assessment"] = "Normal travel distance"
+        
+        logger.info(f"Travel risk calculation complete: {travel_details}")
+        return risk_score, travel_details
+        
+    except Exception as e:
+        logger.error(f"Error in travel risk calculation: {e}")
+        return 0.0, {"error": str(e)}
 
-    if model is None:
-        # If no model exists, consider it medium risk
-        return 0.5
+def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, user, prev_location=None, current_location=None, time_diff_hours=0.0):
+    # Get most recent login attempt
+    previous_attempt = LoginAttempt.query.filter_by(
+        user_id=user.id
+    ).order_by(LoginAttempt.login_time.desc()).first()
+    
+    # Calculate travel risk if previous attempt exists
+    travel_risk = 0.0
+    if prev_location and current_location:
+        travel_risk, travel_details = calculate_travel_risk(
+            prev_location,
+            current_location,
+            time_diff_hours
+        )
+        
+        if travel_risk > 0:
+            logger.info("Travel Analysis:")
+            logger.info(f"Previous location: {prev_location['city']}, {prev_location['region']}, {prev_location['country']}")
+            logger.info(f"Current location: {current_location['city']}, {current_location['region']}, {current_location['country']}")
+            logger.info(f"Time difference: {time_diff_hours:.2f} hours")
+            logger.info(f"Travel details: {travel_details}")
+            logger.info(f"Travel risk score: {travel_risk}")
+
+    # Get trusted locations first
+    trusted_locations = TrustedLocation.query.filter_by(user_id=user.id).all()
+    trusted_countries = set(tl.country for tl in trusted_locations)
+    trusted_regions = set(tl.region for tl in trusted_locations)
+    trusted_cities = set(tl.city for tl in trusted_locations)
+
+    # Check if user is new (less than X login attempts)
+    user_attempts = LoginAttempt.query.filter_by(user_id=user.id).count()
+    if user_attempts < 5:  # Adjust threshold as needed
+        # Use simplified risk assessment for new users
+        risk_score = 0.0
+        
+        # Basic checks for new users
+        if country not in trusted_countries:
+            risk_score += 0.2
+        if user.failed_attempts > 0:
+            risk_score += 0.1 * user.failed_attempts
+        if login_time.hour not in range(6, 22):  # Assuming typical hours are 6 AM to 10 PM
+            risk_score += 0.1
+            
+        # Cap the risk score for new users
+        risk_score = min(0.6, risk_score)
+        
+        logger.info(f"Using simplified risk assessment for new user: {risk_score}")
+        return risk_score
 
     # Calculate recent attempts
     recent_attempts = LoginAttempt.query.filter_by(
@@ -529,105 +658,90 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
     is_typical_hour = 1 if login_time.hour in typical_hours else 0
     time_anomaly = 1 - is_typical_hour
 
-    # Trusted locations
-    trusted_countries = [tl.country for tl in user.trusted_locations]
-    trusted_regions = [tl.region for tl in user.trusted_locations]
-    trusted_cities = [tl.city for tl in user.trusted_locations]
-
+    # Location trust calculation
     is_trusted_country = 1 if country in trusted_countries else 0
     is_trusted_region = 1 if region in trusted_regions else 0
     is_trusted_city = 1 if city in trusted_cities else 0
 
-    # Encoding features
-    def safe_encode(encoder, value):
-        try:
-            if value in encoder.classes_:
-                return encoder.transform([value])[0]
-            else:
-                return -1  # Assign -1 to unseen categories
-        except (ValueError, AttributeError):
-            return -1
+    # Calculate location trust factor
+    location_trust = 0.0
+    if is_trusted_country:
+        location_trust += 0.4
+    if is_trusted_region:
+        location_trust += 0.3
+    if is_trusted_city:
+        location_trust += 0.3
 
-    ip_address_encoded = safe_encode(encoder_ip, ip_address)
-    user_agent_encoded = safe_encode(encoder_agent, user_agent)
-    country_encoded = safe_encode(encoder_country, country)
-    region_encoded = safe_encode(encoder_region, region)
-    city_encoded = safe_encode(encoder_city, city)
-
-    # Prepare input data
+    # Prepare input data for ML model
     input_data = pd.DataFrame({
-        'ip_address_encoded': [ip_address_encoded],
-        'user_agent_encoded': [user_agent_encoded],
-        'hour': [login_time.hour],
-        'day_of_week': [login_time.weekday()],
-        'is_typical_hour': [is_typical_hour],
-        'country_encoded': [country_encoded],
-        'region_encoded': [region_encoded],
-        'city_encoded': [city_encoded],
         'failed_attempts': [user.failed_attempts],
-        'attempts_24h': [len(recent_attempts)],
         'failed_attempts_24h': [failed_attempts_24h],
+        'attempts_24h': [len(recent_attempts)],
         'unique_ips_24h': [unique_ips_24h],
         'unique_locations_24h': [unique_locations_24h],
+        'is_typical_hour': [is_typical_hour],
+        'time_anomaly': [time_anomaly],
+        'hour': [login_time.hour],
+        'day_of_week': [login_time.weekday()],
+        'ip_address_encoded': [safe_encode(encoder_ip, ip_address)],
+        'user_agent_encoded': [safe_encode(encoder_agent, user_agent)],
+        'country_encoded': [safe_encode(encoder_country, country)],
+        'region_encoded': [safe_encode(encoder_region, region)],
+        'city_encoded': [safe_encode(encoder_city, city)],
         'is_trusted_country': [is_trusted_country],
         'is_trusted_region': [is_trusted_region],
-        'is_trusted_city': [is_trusted_city],
-        'time_anomaly': [time_anomaly],
+        'is_trusted_city': [is_trusted_city]
     })
 
-    # Ensure columns match model features
     try:
-        input_data = input_data[model_features]
-    except KeyError as e:
-        missing_features = set(model_features) - set(input_data.columns)
-        logger.error(f"Missing features in input data: {missing_features}")
-        return 0.5  # Default risk score on error
-
-    # Log the features used for the prediction
-    logger.info(f"Risk assessment input data:\n{input_data}")
-    logger.info(f"Failed attempts for user {user.username}: {user.failed_attempts}")
-
-    # Add direct location risk factor
-    location_risk = 0.0
-    if country not in trusted_countries:
-        location_risk += 0.3
-    if region not in trusted_regions:
-        location_risk += 0.2
-    if city not in trusted_cities:
-        location_risk += 0.1
-
-    # Make prediction
-    try:
+        # Get base risk score from ML model
         risk_probs = model.predict_proba(input_data)[0]
         anomalous_index = list(model.classes_).index(1)
-        risk_score = risk_probs[anomalous_index]
+        base_risk_score = risk_probs[anomalous_index]
         
-        # Combine ML risk with location risk
-        risk_score = max(risk_score, location_risk)
+        # Calculate failed attempts factor
+        failed_attempts_factor = min(user.failed_attempts / 4.0, 1.0)
 
-        # Adjust risk score based on failed attempts
-        if user.failed_attempts >= 3:
-            risk_score = max(0.4, risk_score)  # Ensure at least OTP verification
+        # Start with base risk score
+        risk_score = base_risk_score
+
+        # Adjust based on location trust
+        if location_trust == 0:  # Completely untrusted location
+            risk_score = max(0.4, risk_score)
+        elif location_trust < 1.0:  # Partially trusted location
+            # Add base risk for partially trusted locations
+            base_untrusted_risk = 0.2  # Base risk for untrusted elements
+            untrusted_factor = 1.0 - location_trust
+            adjustment = (untrusted_factor * 0.3 * (1 + base_risk_score)) + base_untrusted_risk
+            risk_score = risk_score + adjustment
+        else:  # Fully trusted location
+            risk_score *= 0.5
+
+        # Add failed attempts influence
+        risk_score = risk_score + (failed_attempts_factor * 0.2)
         
-        # Cap the risk score at 0.6 for location-based risks
-        if location_risk > 0.5:
-            risk_score = min(max(0.6, risk_score), 1.0)
+        # Adjust for travel risk if significant
+        if travel_risk > 0.7:
+            risk_score = max(risk_score, 0.8)
+
+        # Apply reasonable bounds
+        risk_score = max(0.1, min(0.9, risk_score))
+
+        logger.info(f"\nRisk Assessment Details:")
+        logger.info(f"Base ML Risk Score: {base_risk_score}")
+        logger.info(f"Location Trust Factor: {location_trust}")
+        logger.info(f"Failed Attempts Factor: {failed_attempts_factor}")
+        logger.info(f"Final Risk Score: {risk_score}")
+        logger.info(f"Location Status:")
+        logger.info(f"- Country: {country} ({'trusted' if is_trusted_country else 'untrusted'})")
+        logger.info(f"- Region: {region} ({'trusted' if is_trusted_region else 'untrusted'})")
+        logger.info(f"- City: {city} ({'trusted' if is_trusted_city else 'untrusted'})")
+
+        return risk_score
 
     except Exception as e:
         logger.error(f"Error in risk assessment: {e}")
-        risk_score = 0.5
-
-    # Add logging for risk factors
-    print(f"\nRisk Assessment Details:")
-    print(f"Base ML Risk Score: {risk_probs[anomalous_index]}")
-    print(f"Location Risk: {location_risk}")
-    print(f"Final Risk Score: {risk_score}")
-    print(f"Location Status:")
-    print(f"- Country: {country} ({'trusted' if country in trusted_countries else 'untrusted'})")
-    print(f"- Region: {region} ({'trusted' if region in trusted_regions else 'untrusted'})")
-    print(f"- City: {city} ({'trusted' if city in trusted_cities else 'untrusted'})")
-
-    return risk_score
+        return 0.5
 
 def prepare_and_train_model():
     global model, encoder_ip, encoder_agent, encoder_country, encoder_region, encoder_city, model_features
@@ -636,6 +750,41 @@ def prepare_and_train_model():
     attempts = LoginAttempt.query.all()
     data = []
 
+    # Add common user agents to ensure they're in the encoder
+    common_user_agents = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15',
+        'Mozilla/5.0 (Linux; Android 10; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.162 Mobile Safari/537.36',
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1'
+    ]
+
+    # Create initial data with common user agents
+    for user_agent in common_user_agents:
+        base_data = {
+            'user_id': 1,
+            'ip_address': '127.0.0.1',
+            'user_agent': user_agent,
+            'hour': 9,
+            'day_of_week': 1,
+            'is_typical_hour': 1,
+            'country': 'Unknown',
+            'region': 'Unknown',
+            'city': 'Unknown',
+            'failed_attempts': 0,
+            'attempts_24h': 1,
+            'failed_attempts_24h': 0,
+            'unique_ips_24h': 1,
+            'unique_locations_24h': 1,
+            'is_trusted_country': 0,
+            'is_trusted_region': 0,
+            'is_trusted_city': 0,
+            'time_anomaly': 0,
+            'label': 0
+        }
+        data.append(base_data)
+
+    # Add real login attempts
     for attempt in attempts:
         user = User.query.filter_by(id=attempt.user_id).first()
         if not user:
@@ -688,17 +837,12 @@ def prepare_and_train_model():
         }
         data.append(attempt_data)
 
-    # Generate synthetic data
+    # Add synthetic data
     synthetic_data = generate_synthetic_attempts(1000)
     data.extend(synthetic_data)
 
     # Convert to DataFrame
     df = pd.DataFrame(data)
-
-    # Check label distribution
-    label_counts = df['label'].value_counts()
-    print("\nLabel Distribution in Training Data:")
-    print(label_counts)
 
     # Enhanced feature encoding
     categorical_features = ['ip_address', 'user_agent', 'country', 'region', 'city']
@@ -755,8 +899,35 @@ def prepare_and_train_model():
     print("\nLabel Distribution After SMOTE:")
     print(balanced_label_counts)
 
-    # Train the model
-    model.fit(X_balanced, y_balanced)
+    # Modify feature weights through sample weights
+    sample_weights = np.ones(len(X_balanced))
+    
+    # Identify indices for different feature types
+    device_change_indices = y_balanced[
+        (X_balanced['user_agent_encoded'] != X_balanced['user_agent_encoded'].mode()[0])
+    ].index
+    location_indices = y_balanced[
+        (X_balanced['is_trusted_country'] == 1) & 
+        (X_balanced['is_trusted_region'] == 1) & 
+        (X_balanced['is_trusted_city'] == 1)
+    ].index
+    
+    # Adjust weights
+    sample_weights[device_change_indices] *= 2.0  # Increase importance of device changes
+    sample_weights[location_indices] *= 1.5  # Keep location importance
+    
+    # Modified GradientBoostingClassifier parameters
+    model = GradientBoostingClassifier(
+        n_estimators=150,
+        random_state=42,
+        learning_rate=0.08,
+        max_depth=4,
+        subsample=0.8,
+        max_features='sqrt'
+    )
+
+    # Train with sample weights
+    model.fit(X_balanced, y_balanced, sample_weight=sample_weights)
 
     # Print feature importance once
     feature_importance = pd.DataFrame({
@@ -784,74 +955,105 @@ def init_model():
     with app.app_context():
         db.create_all()
         
-        # Try to load existing model
+        # Common default values
+        common_user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15',
+            'Mozilla/5.0 (Linux; Android 10; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.162 Mobile Safari/537.36',
+            'Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1'
+        ]
+        
+        # Initialize and fit encoders with default values
+        encoder_ip = LabelEncoder().fit(['127.0.0.1', '192.168.1.1'])
+        encoder_agent = LabelEncoder().fit(common_user_agents)
+        encoder_country = LabelEncoder().fit(['Unknown', 'Taiwan', 'Japan', 'Singapore', 'United States'])
+        encoder_region = LabelEncoder().fit(['Unknown', 'Taipei', 'Tokyo', 'Singapore', 'California'])
+        encoder_city = LabelEncoder().fit(['Unknown', 'Taipei', 'Tokyo', 'Singapore', 'Mountain View'])
+        
+        # Try to load existing model and encoders
         try:
             model = joblib.load('model.joblib')
             encoders = joblib.load('encoders.joblib')
-            encoder_ip = encoders['encoder_ip']
-            encoder_agent = encoders['encoder_agent']
-            encoder_country = encoders['encoder_country']
-            encoder_region = encoders['encoder_region']
-            encoder_city = encoders['encoder_city']
+            
+            # Update encoders with saved values while preserving default values
+            encoder_ip = LabelEncoder().fit(list(set(list(encoder_ip.classes_) + list(encoders['encoder_ip'].classes_))))
+            encoder_agent = LabelEncoder().fit(list(set(list(encoder_agent.classes_) + list(encoders['encoder_agent'].classes_))))
+            encoder_country = LabelEncoder().fit(list(set(list(encoder_country.classes_) + list(encoders['encoder_country'].classes_))))
+            encoder_region = LabelEncoder().fit(list(set(list(encoder_region.classes_) + list(encoders['encoder_region'].classes_))))
+            encoder_city = LabelEncoder().fit(list(set(list(encoder_city.classes_) + list(encoders['encoder_city'].classes_))))
+            
             model_features = encoders['model_features']
-            logger.info("Loaded existing model")
-        except:
-            logger.info("Training new model...")
+            logger.info("Loaded existing model and merged encoder classes")
+        except Exception as e:
+            logger.info(f"Training new model... ({str(e)})")
             prepare_and_train_model()
         
         schedule_model_retraining()
 
 def generate_synthetic_attempts(num_samples):
     synthetic_data = []
+    common_user_agents = [
+        'default_device',  # Our baseline device
+        'new_device',      # Our test device
+        'unknown_device'   # Represent potentially suspicious devices
+    ]
     
     for _ in range(num_samples):
-        # Generate core behavioral metrics
-        failed_attempts = random.randint(0, 5)
-        attempts_24h = random.randint(max(failed_attempts, 1), 10)
-        failed_attempts_24h = failed_attempts + random.randint(0, 2)
+        # Base pattern: users typically stick to 1-2 devices
+        user_devices = random.sample(common_user_agents, k=random.choices([1, 2, 3], weights=[0.6, 0.3, 0.1])[0])
+        current_device = random.choice(user_devices)
         
         # Time-based patterns
         hour = random.randint(0, 23)
-        is_typical_hour = random.choices([1, 0], weights=[0.8, 0.2])[0]  # Most logins during typical hours
-        time_anomaly = 1 - is_typical_hour
+        is_typical_hour = random.choices([1, 0], weights=[0.8, 0.2])[0]
         
-        # Velocity checks
-        unique_ips_24h = random.randint(1, 3)
+        # Location patterns
+        is_trusted_location = random.choices([1, 0], weights=[0.8, 0.2])[0]
+        
+        # Calculate various metrics
+        failed_attempts = random.randint(0, 5)
+        failed_attempts_24h = random.randint(failed_attempts, failed_attempts + 3)
+        unique_ips_24h = random.randint(1, 4)
         unique_locations_24h = random.randint(1, 3)
         
-        # Determine risk based primarily on behavior
+        # Determine risk based on combined factors
         is_anomalous = 0
         if any([
-            failed_attempts >= 3,                    # Multiple failed attempts
-            failed_attempts_24h >= 5,                # Many failures in 24h
-            unique_ips_24h >= 3,                     # Multiple IPs
-            unique_locations_24h >= 3,               # Multiple locations
-            (not is_typical_hour and random.random() < 0.7)  # Unusual time
+            failed_attempts >= 3,
+            failed_attempts_24h >= 5,
+            unique_ips_24h >= 3,
+            unique_locations_24h >= 3,
+            (not is_typical_hour and random.random() < 0.7),
+            (current_device == 'unknown_device' and random.random() < 0.8),  # High chance of anomaly for unknown devices
+            (len(user_devices) == 3 and random.random() < 0.6)  # Suspicious when using too many devices
         ]):
             is_anomalous = 1
         
-        attempt = {
-            'user_id': random.randint(1, 100),
-            'ip_address': f"{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(0,255)}",
-            'user_agent': random.choice(['common_browser', 'unusual_agent', 'bot_agent']),
+        # Generate sample
+        sample = {
+            'user_id': 1,
+            'ip_address': f'192.168.1.{random.randint(1, 255)}',
+            'user_agent': current_device,
             'hour': hour,
             'day_of_week': random.randint(0, 6),
             'is_typical_hour': is_typical_hour,
-            'country': f"Country_{random.randint(1,50)}",
-            'region': f"Region_{random.randint(1,20)}",
-            'city': f"City_{random.randint(1,100)}",
+            'country': 'Taiwan' if is_trusted_location else random.choice(['Japan', 'Singapore', 'Unknown']),
+            'region': 'Taipei' if is_trusted_location else 'Unknown',
+            'city': 'Taipei' if is_trusted_location else 'Unknown',
             'failed_attempts': failed_attempts,
-            'attempts_24h': attempts_24h,
+            'attempts_24h': random.randint(max(failed_attempts_24h, 1), failed_attempts_24h + 10),
             'failed_attempts_24h': failed_attempts_24h,
             'unique_ips_24h': unique_ips_24h,
             'unique_locations_24h': unique_locations_24h,
-            'is_trusted_country': random.choice([0, 1]),
-            'is_trusted_region': random.choice([0, 1]),
-            'is_trusted_city': random.choice([0, 1]),
-            'time_anomaly': time_anomaly,
+            'is_trusted_country': is_trusted_location,
+            'is_trusted_region': is_trusted_location,
+            'is_trusted_city': is_trusted_location,
+            'time_anomaly': 1 - is_typical_hour,
             'label': is_anomalous
         }
-        synthetic_data.append(attempt)
+        synthetic_data.append(sample)
+    
     return synthetic_data
 
 def schedule_model_retraining():
@@ -891,6 +1093,25 @@ def check_records():
         output.append(f"Location: {location.country}, {location.region}, {location.city}")
     
     return "<br>".join(output)
+
+@app.route('/set_test_mode', methods=['POST'])
+def set_test_mode():
+    session['is_test_mode'] = True
+    return 'OK'
+
+@app.route('/reset_login_times')
+def reset_login_times():
+    try:
+        # Get current time
+        current_time = datetime.datetime.now()
+        
+        # Update all login times to current time
+        LoginAttempt.query.update({LoginAttempt.login_time: current_time})
+        db.session.commit()
+        return 'Login times reset to current time'
+    except Exception as e:
+        db.session.rollback()
+        return f'Error resetting login times: {str(e)}'
 
 if __name__ == '__main__':
     if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
