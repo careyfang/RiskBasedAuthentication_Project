@@ -367,7 +367,7 @@ def login():
             user.failed_attempts = 0
             db.session.commit()
 
-            if risk_score < 0.31:
+            if risk_score < 0.3:
                 session['user_id'] = user.id
                 return redirect(url_for('dashboard'))
             elif risk_score < 0.6:
@@ -600,6 +600,12 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
         user_id=user.id
     ).order_by(LoginAttempt.login_time.desc()).first()
     
+    # Check for device change
+    device_change_risk = 0.0
+    if previous_attempt and previous_attempt.user_agent != user_agent:
+        logger.info("New device detected")
+        device_change_risk = 0.3  # Add significant risk for new device
+    
     # Calculate travel risk if previous attempt exists
     travel_risk = 0.0
     if prev_location and current_location:
@@ -699,6 +705,9 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
         anomalous_index = list(model.classes_).index(1)
         base_risk_score = risk_probs[anomalous_index]
         
+        # Add device change risk to base score
+        base_risk_score = max(base_risk_score, device_change_risk)
+        
         # Calculate failed attempts factor
         failed_attempts_factor = min(user.failed_attempts / 4.0, 1.0)
 
@@ -729,6 +738,7 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
 
         logger.info(f"\nRisk Assessment Details:")
         logger.info(f"Base ML Risk Score: {base_risk_score}")
+        logger.info(f"Device Change Risk: {device_change_risk}")
         logger.info(f"Location Trust Factor: {location_trust}")
         logger.info(f"Failed Attempts Factor: {failed_attempts_factor}")
         logger.info(f"Final Risk Score: {risk_score}")

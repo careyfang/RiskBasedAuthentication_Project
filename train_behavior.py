@@ -254,7 +254,7 @@ class BehaviorTester:
         print("\n=== Testing Location Trust Levels ===")
         
         # Set test mode to prevent adding locations to trusted
-        self.session.post(f'{self.base_url}/set_test_mode')  # New endpoint needed
+        self.session.post(f'{self.base_url}/set_test_mode')
         
         locations = {
             'unseen_city': {
@@ -285,11 +285,18 @@ class BehaviorTester:
         # Make sure we're not in training mode
         self.is_training = False
         
+        base_time = self.current_time
+        
         for time_type, hour in times.items():
             print(f"\nTesting during {time_type} hours ({hour}:00):")
-            self.set_time(hour)
             
             for loc_type, location in locations.items():
+                # Reset base time for each location
+                self.current_time = base_time
+                
+                # Set initial time for this location
+                self.set_time(hour)
+                
                 # Test with default device
                 print(f"\nLogin from {loc_type} using default device")
                 self.set_location(location)
@@ -298,12 +305,15 @@ class BehaviorTester:
                 
                 if '/security_question' in response.url:
                     print(f"Login at {self.current_time} - Response URL: {response.url}")
-                    self.answer_security_question(add_to_trusted=False)  # Explicitly don't add to trusted
+                    self.answer_security_question(add_to_trusted=False)
                     print("Answered security question")
                 else:
                     print(f"Login at {self.current_time} - Response URL: {response.url}")
                 
                 time.sleep(1)
+                
+                # Add 1 hour for next test
+                self.set_time(hour + 1)
                 
                 # Test with new device
                 print(f"\nLogin from {loc_type} using new device")
@@ -313,12 +323,15 @@ class BehaviorTester:
                 
                 if '/security_question' in response.url:
                     print(f"Login at {self.current_time} - Response URL: {response.url}")
-                    self.answer_security_question(add_to_trusted=False)  # Explicitly don't add to trusted
+                    self.answer_security_question(add_to_trusted=False)
                     print("Answered security question")
                 else:
                     print(f"Login at {self.current_time} - Response URL: {response.url}")
                 
                 time.sleep(1)
+                
+                # Advance base time by 24 hours for next location
+                base_time += timedelta(days=1)
 
     def answer_security_question(self, add_to_trusted=True):
         """Answer security question with option to add location to trusted"""
