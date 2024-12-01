@@ -196,6 +196,8 @@ def security_question():
             if login_attempt:
                 login_attempt.label = 0
                 add_to_trusted_locations(user_id, login_attempt)
+                # Add device to trusted devices
+                add_to_trusted_devices(user_id, login_attempt.user_agent)
                 db.session.commit()
                 prepare_and_train_model()
 
@@ -208,15 +210,12 @@ def security_question():
 
 def add_to_trusted_locations(user_id, login_attempt):
     """Add location to trusted locations after successful verification"""
-    # Trust location after successful verification unless it's a test
+    # Only add trusted locations if not in test mode and during training
     is_test = session.get('is_test_mode', False)
-    should_trust = not is_test  # Trust unless explicitly in test mode
-    
-    if should_trust and all(x not in ['Unknown', 'None'] 
-                          for x in [login_attempt.country, 
-                                  login_attempt.region, 
-                                  login_attempt.city]):
-        
+    is_training = session.get('is_initial_training', False)
+    should_trust = is_training and not is_test
+
+    if should_trust and login_attempt:
         existing_location = TrustedLocation.query.filter_by(
             user_id=user_id,
             country=login_attempt.country,
@@ -225,7 +224,6 @@ def add_to_trusted_locations(user_id, login_attempt):
         ).first()
 
         if not existing_location:
-            print(f"Adding trusted location: {login_attempt.country}, {login_attempt.region}, {login_attempt.city}")
             new_location = TrustedLocation(
                 user_id=user_id,
                 country=login_attempt.country,
@@ -442,6 +440,9 @@ def verify_identity():
                                 city=login_attempt.city
                             )
                             db.session.add(new_location)
+                    
+                    # Add device to trusted devices
+                    add_to_trusted_devices(user_id, login_attempt.user_agent)
                     
                     db.session.commit()
                     prepare_and_train_model()
@@ -682,11 +683,11 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
     # Calculate location trust factor
     location_trust = 0.0
     if is_trusted_country:
-        location_trust += 0.4
+        location_trust += 0.5
     if is_trusted_region:
         location_trust += 0.3
     if is_trusted_city:
-        location_trust += 0.3
+        location_trust += 0.2
 
     # Prepare input data for ML model
     input_data = pd.DataFrame({
@@ -1133,6 +1134,27 @@ def reset_login_times():
     except Exception as e:
         db.session.rollback()
         return f'Error resetting login times: {str(e)}'
+
+def add_to_trusted_devices(user_id, user_agent):
+    """Add device to trusted devices after successful verification"""
+    # Only add trusted devices if not in test mode
+    is_test = session.get('is_test_mode', False)
+    
+    if not is_test and user_agent:
+        existing_device = TrustedDevice.query.filter_by(
+            user_id=user_id,
+            user_agent=user_agent
+        ).first()
+
+        if not existing_device:
+            logger.info(f"Adding new trusted device for user {user_id}")
+            new_device = TrustedDevice(
+                user_id=user_id,
+                user_agent=user_agent
+            )
+            db.session.add(new_device)
+            db.session.commit()
+            logger.info("Device added successfully")
 
 if __name__ == '__main__':
     if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':

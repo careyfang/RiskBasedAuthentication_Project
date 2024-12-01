@@ -264,21 +264,21 @@ class BehaviorTester:
         locations = {
             'unseen_city': {
                 'ip': '1.1.1.1',
-                'country': 'Taiwan',  # Known
-                'region': 'Taipei',   # Known
-                'city': 'New Taipei'  # Unseen
+                'country': 'Taiwan',
+                'region': 'Taipei',
+                'city': 'New Taipei'
             },
             'unseen_region': {
                 'ip': '1.1.1.2',
-                'country': 'Taiwan',    # Known
-                'region': 'Kaohsiung',  # Unseen
-                'city': 'Kaohsiung'     # Unseen
+                'country': 'Taiwan',
+                'region': 'Kaohsiung',
+                'city': 'Kaohsiung'
             },
             'unseen_country': {
                 'ip': '1.1.1.3',
-                'country': 'Malaysia',  # Unseen
-                'region': 'KL',        # Unseen
-                'city': 'KL'          # Unseen
+                'country': 'Japan',
+                'region': 'Tokyo',
+                'city': 'Tokyo'
             }
         }
         
