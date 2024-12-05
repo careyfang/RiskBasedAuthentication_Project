@@ -6,13 +6,17 @@
 </head>
 <body>
     <h1>Welcome, {{ username }}!</h1>
-    <p>Your risk score: {{ risk_score }}</p>
+    <p><strong>Final Risk Score:</strong> {{ risk_score }}</p>
 
-    <h2>Your Current Session Info</h2>
+    <h2>Risk Assessment Details</h2>
+    <p><strong>Base ML Risk Score:</strong> {{ base_ml_risk_score }}</p>
+    <p><strong>Device Change Risk:</strong> {{ device_change_risk }}</p>
+    <p><strong>Location Trust Factor:</strong> {{ location_trust_factor }}</p>
+    <p><strong>Failed Attempts Factor:</strong> {{ failed_attempts_factor }}</p>
+
+    <h2>Current Session Info</h2>
     <p><strong>IP Address:</strong> {{ ip_address }}</p>
     <p><strong>Location:</strong> {{ city }}, {{ region }}, {{ country }}</p>
     <p><strong>Device:</strong> {{ user_agent }}</p>
-
-    <!-- Add any other dashboard elements or links here -->
 </body>
 </html>

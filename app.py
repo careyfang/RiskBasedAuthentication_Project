@@ -331,7 +331,7 @@ def login():
             }
 
             # Perform risk assessment with location and time data
-            risk_score = assess_risk_ml(
+            risk_results = assess_risk_ml(
                 ip_address, 
                 user_agent, 
                 current_time, 
@@ -343,8 +343,17 @@ def login():
                 current_location=current_location,
                 time_diff_hours=time_diff_hours
             )
-            print(f"Risk score for user {user.username}: {risk_score}")
-            session['risk_score'] = risk_score
+
+            # Extract the final risk score
+            final_risk_score = risk_results['risk_score']
+            print(f"Risk score for user {user.username}: {final_risk_score}")
+
+            # Store all metrics individually in the session
+            session['risk_score'] = final_risk_score
+            session['base_ml_risk_score'] = risk_results['base_ml_risk_score']
+            session['device_change_risk'] = risk_results['device_change_risk']
+            session['location_trust_factor'] = risk_results['location_trust_factor']
+            session['failed_attempts_factor'] = risk_results['failed_attempts_factor']
 
             # Store login attempt with simulated time
             login_attempt = LoginAttempt(
@@ -365,10 +374,10 @@ def login():
             user.failed_attempts = 0
             db.session.commit()
 
-            if risk_score < 0.3:
+            if final_risk_score < 0.3:
                 session['user_id'] = user.id
                 return redirect(url_for('dashboard'))
-            elif risk_score < 0.6:
+            elif final_risk_score < 0.6:
                 session['user_id'] = user.id
                 return redirect(url_for('verify_identity'))
             else:
@@ -384,7 +393,6 @@ def login():
 def dashboard():
     user_id = session.get('user_id')
     if not user_id:
-        # Handle the case where user_id is not in session
         flash('Session expired. Please log in again.')
         return redirect(url_for('login'))
 
@@ -393,11 +401,15 @@ def dashboard():
         flash('User not found.')
         return redirect(url_for('login'))
 
+    # Retrieve risk metrics from the session
     risk_score = session.get('risk_score', 'N/A')
+    base_ml_risk_score = session.get('base_ml_risk_score', 'N/A')
+    device_change_risk = session.get('device_change_risk', 'N/A')
+    location_trust_factor = session.get('location_trust_factor', 'N/A')
+    failed_attempts_factor = session.get('failed_attempts_factor', 'N/A')
 
-    # Fetch the most recent login attempt for the user
+    # Retrieve last login attempt details for IP, location, device if you want (already in code)
     login_attempt = LoginAttempt.query.filter_by(user_id=user_id).order_by(LoginAttempt.id.desc()).first()
-
     if login_attempt:
         ip_address = login_attempt.ip_address
         country = login_attempt.country if login_attempt.country else 'Unknown'
@@ -405,7 +417,6 @@ def dashboard():
         city = login_attempt.city if login_attempt.city else 'Unknown'
         user_agent = login_attempt.user_agent if login_attempt.user_agent else 'Unknown'
     else:
-        # If no login attempt found, default to 'Unknown' or similar placeholders
         ip_address = 'Unknown'
         country = 'Unknown'
         region = 'Unknown'
@@ -413,15 +424,20 @@ def dashboard():
         user_agent = 'Unknown'
 
     return render_template(
-        'dashboard.html', 
-        username=user.username, 
+        'dashboard.html',
+        username=user.username,
         risk_score=risk_score,
+        base_ml_risk_score=base_ml_risk_score,
+        device_change_risk=device_change_risk,
+        location_trust_factor=location_trust_factor,
+        failed_attempts_factor=failed_attempts_factor,
         ip_address=ip_address,
         country=country,
         region=region,
         city=city,
         user_agent=user_agent
     )
+
 
 
 @app.route('/verify_identity', methods=['GET', 'POST'])
@@ -787,11 +803,23 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
         logger.info(f"- Region: {region} ({'trusted' if is_trusted_region else 'untrusted'})")
         logger.info(f"- City: {city} ({'trusted' if is_trusted_city else 'untrusted'})")
 
-        return risk_score
+        return {
+            'base_ml_risk_score': base_risk_score,
+            'device_change_risk': device_change_risk,
+            'location_trust_factor': location_trust,
+            'failed_attempts_factor': failed_attempts_factor,
+            'risk_score': risk_score
+        }
 
     except Exception as e:
         logger.error(f"Error in risk assessment: {e}")
-        return 0.5
+        return {
+            'base_ml_risk_score': 'N/A',
+            'device_change_risk': 'N/A',
+            'location_trust_factor': 'N/A',
+            'failed_attempts_factor': 'N/A',
+            'risk_score': 0.5
+        }
 
 def prepare_and_train_model():
     global model, encoder_ip, encoder_agent, encoder_country, encoder_region, encoder_city, model_features
