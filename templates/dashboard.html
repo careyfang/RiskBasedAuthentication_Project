@@ -1,7 +1,18 @@
-<!-- templates/dashboard.html -->
-{% extends 'base.html' %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>Dashboard</title>
+</head>
+<body>
+    <h1>Welcome, {{ username }}!</h1>
+    <p>Your risk score: {{ risk_score }}</p>
 
-{% block content %}
-<h1>Welcome, {{ username }}!</h1>
-<p>This is your dashboard.</p>
-{% endblock %}
+    <h2>Your Current Session Info</h2>
+    <p><strong>IP Address:</strong> {{ ip_address }}</p>
+    <p><strong>Location:</strong> {{ city }}, {{ region }}, {{ country }}</p>
+    <p><strong>Device:</strong> {{ user_agent }}</p>
+
+    <!-- Add any other dashboard elements or links here -->
+</body>
+</html>

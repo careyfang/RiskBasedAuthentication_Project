@@ -394,7 +394,35 @@ def dashboard():
         return redirect(url_for('login'))
 
     risk_score = session.get('risk_score', 'N/A')
-    return render_template('dashboard.html', username=user.username, risk_score=risk_score)
+
+    # Fetch the most recent login attempt for the user
+    login_attempt = LoginAttempt.query.filter_by(user_id=user_id).order_by(LoginAttempt.id.desc()).first()
+
+    if login_attempt:
+        ip_address = login_attempt.ip_address
+        country = login_attempt.country if login_attempt.country else 'Unknown'
+        region = login_attempt.region if login_attempt.region else 'Unknown'
+        city = login_attempt.city if login_attempt.city else 'Unknown'
+        user_agent = login_attempt.user_agent if login_attempt.user_agent else 'Unknown'
+    else:
+        # If no login attempt found, default to 'Unknown' or similar placeholders
+        ip_address = 'Unknown'
+        country = 'Unknown'
+        region = 'Unknown'
+        city = 'Unknown'
+        user_agent = 'Unknown'
+
+    return render_template(
+        'dashboard.html', 
+        username=user.username, 
+        risk_score=risk_score,
+        ip_address=ip_address,
+        country=country,
+        region=region,
+        city=city,
+        user_agent=user_agent
+    )
+
 
 @app.route('/verify_identity', methods=['GET', 'POST'])
 def verify_identity():
@@ -642,7 +670,7 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
 
     # Check if user is new (less than X login attempts)
     user_attempts = LoginAttempt.query.filter_by(user_id=user.id).count()
-    if user_attempts < 5:  # Adjust threshold as needed
+    if user_attempts < 1:  # Adjust threshold as needed
         # Use simplified risk assessment for new users
         risk_score = 0.0
         
