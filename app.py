@@ -577,24 +577,31 @@ def label_attempt(user_id, ip_address, user_agent, country, region, city):
     return 0  # Mark as legitimate
 
 def calculate_travel_risk(previous_location, current_location, time_difference_hours):
+    # Check for None locations before attempting to use them
+    if previous_location is None or current_location is None:
+        logger.error("Previous or current location is None, cannot calculate travel risk.")
+        return 0.0, {"error": "One or both locations are None."}
+
+    # Check for 'Local', 'Unknown', or 'None' values in the location data
+    if any(x in ['Local', 'Unknown', 'None']
+           for loc in [previous_location, current_location]
+           for x in loc.values()):
+        return 0.0, {"error": "Local or unknown locations - skipping travel calculation"}
+
     try:
-        # Skip for invalid locations
-        if any(x in ['Local', 'Unknown', 'None'] 
-               for loc in [previous_location, current_location] 
-               for x in loc.values()):
-            return 0.0, {"error": "Local or unknown locations - skipping travel calculation"}
-            
-        # Get coordinates and calculate distance
-        coords1 = get_cached_coords(previous_location['city'], previous_location['region'], previous_location['country'])
-        coords2 = get_cached_coords(current_location['city'], current_location['region'], current_location['country'])
+        coords1 = get_cached_coords(previous_location['city'],
+                                    previous_location['region'],
+                                    previous_location['country'])
+        coords2 = get_cached_coords(current_location['city'],
+                                    current_location['region'],
+                                    current_location['country'])
+
         distance = geodesic(coords1, coords2).miles
-        
-        # Minimum time threshold (1 minute = 0.016667 hours)
-        MIN_TIME = 0.016667
-        
+        MIN_TIME = 0.016667  # 1 minute in hours
+
         # If time difference is too small but locations differ
         if time_difference_hours < MIN_TIME and distance > 0:
-            required_speed = distance / MIN_TIME  # Use minimum time to avoid infinity
+            required_speed = distance / MIN_TIME
             return 1.0, {
                 "from_location": f"{previous_location['city']}, {previous_location['region']}",
                 "to_location": f"{current_location['city']}, {current_location['region']}",
@@ -603,11 +610,9 @@ def calculate_travel_risk(previous_location, current_location, time_difference_h
                 "required_speed_mph": round(required_speed, 2),
                 "assessment": f"Suspicious: {distance:.1f} miles traveled in less than a minute"
             }
-        
+
         # Normal speed calculation
         required_speed = distance / max(time_difference_hours, MIN_TIME)
-        
-        # Travel assessment
         travel_details = {
             "from_location": f"{previous_location['city']}, {previous_location['region']}",
             "to_location": f"{current_location['city']}, {current_location['region']}",
@@ -617,59 +622,54 @@ def calculate_travel_risk(previous_location, current_location, time_difference_h
             "time_hours": round(time_difference_hours, 2),
             "required_speed_mph": round(required_speed, 2)
         }
-        
-        # Risk assessment
-        if required_speed > 600:  # Impossible travel
+
+        if required_speed > 600:
             risk_score = 1.0
             travel_details["assessment"] = "Impossible travel detected"
-        elif required_speed > 550:  # Suspicious but possible
+        elif required_speed > 550:
             risk_score = 0.7
             travel_details["assessment"] = "Suspicious travel speed"
-        elif distance > 100:  # Long distance but reasonable speed
+        elif distance > 100:
             risk_score = 0.3
             travel_details["assessment"] = "Long distance but feasible"
-        else:  # Short distance
+        else:
             risk_score = 0.0
             travel_details["assessment"] = "Normal travel distance"
-        
+
         logger.info(f"Travel risk calculation complete: {travel_details}")
         return risk_score, travel_details
-        
+
     except Exception as e:
         logger.error(f"Error in travel risk calculation: {e}")
         return 0.0, {"error": str(e)}
 
+
 def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, user, prev_location=None, current_location=None, time_diff_hours=0.0):
-    # Get most recent login attempt
-    previous_attempt = LoginAttempt.query.filter_by(
-        user_id=user.id
-    ).order_by(LoginAttempt.login_time.desc()).first()
-    
-    # Check for device trust
+    # Get the previous attempt to determine device change
+    previous_attempt = LoginAttempt.query.filter_by(user_id=user.id).order_by(LoginAttempt.login_time.desc()).first()
+
+    # Check device trust
     trusted_device = TrustedDevice.query.filter_by(
         user_id=user.id,
         user_agent=user_agent
     ).first()
-    
-    # Check for device change
+
     device_change_risk = 0.0
     if previous_attempt and previous_attempt.user_agent != user_agent:
         logger.info("New device detected")
         if not trusted_device:
-            device_change_risk = 0.3  # This will be used as an adjustment factor
+            device_change_risk = 0.3
             logger.info("Device is not trusted")
         else:
             logger.info("Device is trusted")
-    
-    # Calculate travel risk if previous attempt exists
-    travel_risk = 0.0
-    if prev_location and current_location:
-        travel_risk, travel_details = calculate_travel_risk(
-            prev_location,
-            current_location,
-            time_diff_hours
-        )
-        
+
+    # Compute travel risk once
+    if prev_location is None or current_location is None:
+        logger.info("Cannot calculate travel risk because one or both locations are None.")
+        travel_risk = 0.0
+        travel_details = {"error": "One or both locations are None."}
+    else:
+        travel_risk, travel_details = calculate_travel_risk(prev_location, current_location, time_diff_hours)
         if travel_risk > 0:
             logger.info("Travel Analysis:")
             logger.info(f"Previous location: {prev_location['city']}, {prev_location['region']}, {prev_location['country']}")
@@ -678,53 +678,58 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
             logger.info(f"Travel details: {travel_details}")
             logger.info(f"Travel risk score: {travel_risk}")
 
-    # Get trusted locations first
-    trusted_locations = TrustedLocation.query.filter_by(user_id=user.id).all()
-    trusted_countries = set(tl.country for tl in trusted_locations)
-    trusted_regions = set(tl.region for tl in trusted_locations)
-    trusted_cities = set(tl.city for tl in trusted_locations)
-
-    # Check if user is new (less than X login attempts)
+    # Check if user is new (few attempts)
     user_attempts = LoginAttempt.query.filter_by(user_id=user.id).count()
-    if user_attempts < 1:  # Adjust threshold as needed
-        # Use simplified risk assessment for new users
+    if user_attempts < 1:
+        # Simplified risk assessment for new users
         risk_score = 0.0
-        
         # Basic checks for new users
+        # Increase risk if location untrusted
+        trusted_locations = TrustedLocation.query.filter_by(user_id=user.id).all()
+        trusted_countries = set(tl.country for tl in trusted_locations)
+
         if country not in trusted_countries:
             risk_score += 0.2
         if user.failed_attempts > 0:
             risk_score += 0.1 * user.failed_attempts
-        if login_time.hour not in range(6, 22):  # Assuming typical hours are 6 AM to 10 PM
+        if login_time.hour not in range(6, 22):
             risk_score += 0.1
-            
-        # Cap the risk score for new users
-        risk_score = min(0.6, risk_score)
-        
-        logger.info(f"Using simplified risk assessment for new user: {risk_score}")
-        return risk_score
 
-    # Calculate recent attempts
+        risk_score = min(risk_score, 0.6)
+        logger.info(f"Using simplified risk assessment for new user: {risk_score}")
+        return {
+            'base_ml_risk_score': 'N/A',
+            'device_change_risk': device_change_risk,
+            'location_trust_factor': 0.0,  # Unknown at this early stage
+            'failed_attempts_factor': 0.0,
+            'risk_score': risk_score
+        }
+
+    # Calculate recent attempts stats
     recent_attempts = LoginAttempt.query.filter_by(
         user_id=user.id,
     ).filter(
         LoginAttempt.login_time >= login_time - datetime.timedelta(hours=24)
     ).all()
+
     failed_attempts_24h = sum(1 for a in recent_attempts if a.label == 1)
     unique_ips_24h = len(set(a.ip_address for a in recent_attempts))
     unique_locations_24h = len(set((a.country, a.region, a.city) for a in recent_attempts))
 
-    # Get user's typical hours
     typical_hours = get_user_typical_hours(user.id)
     is_typical_hour = 1 if login_time.hour in typical_hours else 0
     time_anomaly = 1 - is_typical_hour
 
     # Location trust calculation
+    trusted_locations = TrustedLocation.query.filter_by(user_id=user.id).all()
+    trusted_countries = set(tl.country for tl in trusted_locations)
+    trusted_regions = set(tl.region for tl in trusted_locations)
+    trusted_cities = set(tl.city for tl in trusted_locations)
+
     is_trusted_country = 1 if country in trusted_countries else 0
     is_trusted_region = 1 if region in trusted_regions else 0
     is_trusted_city = 1 if city in trusted_cities else 0
 
-    # Calculate location trust factor
     location_trust = 0.0
     if is_trusted_country:
         location_trust += 0.5
@@ -733,7 +738,7 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
     if is_trusted_city:
         location_trust += 0.2
 
-    # Prepare input data for ML model
+    # Prepare input data
     input_data = pd.DataFrame({
         'failed_attempts': [user.failed_attempts],
         'failed_attempts_24h': [failed_attempts_24h],
@@ -754,42 +759,51 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
         'is_trusted_city': [is_trusted_city]
     })
 
+    # Ensure model is not None before prediction
+    if model is None:
+        logger.error("Model is None. Ensure that the model is loaded or trained before prediction.")
+        return {
+            'base_ml_risk_score': 'N/A',
+            'device_change_risk': 'N/A',
+            'location_trust_factor': 'N/A',
+            'failed_attempts_factor': 'N/A',
+            'risk_score': 0.5
+        }
+
     try:
         # Get base risk score from ML model
         risk_probs = model.predict_proba(input_data)[0]
         anomalous_index = list(model.classes_).index(1)
         base_risk_score = risk_probs[anomalous_index]
-        
-        # Apply device change risk as an adjustment
+
+        # Apply device change risk
         if device_change_risk > 0:
-            # Use device change as a multiplier and offset
             risk_score = base_risk_score * (1 + device_change_risk) + (device_change_risk * 0.2)
         else:
             risk_score = base_risk_score
 
-        # Calculate failed attempts factor
+        # Failed attempts factor
         failed_attempts_factor = min(user.failed_attempts / 4.0, 1.0)
 
         # Adjust based on location trust
-        if location_trust == 0:  # Completely untrusted location
+        if location_trust == 0:
             risk_score = max(0.4, risk_score)
-        elif location_trust < 1.0:  # Partially trusted location
-            # Add base risk for partially trusted locations
-            base_untrusted_risk = 0.2  # Base risk for untrusted elements
+        elif location_trust < 1.0:
+            base_untrusted_risk = 0.2
             untrusted_factor = 1.0 - location_trust
             adjustment = (untrusted_factor * 0.3 * (1 + risk_score)) + base_untrusted_risk
             risk_score = risk_score + adjustment
-        else:  # Fully trusted location
+        else:
             risk_score *= 0.5
 
         # Add failed attempts influence
-        risk_score = risk_score + (failed_attempts_factor * 0.2)
-        
+        risk_score += (failed_attempts_factor * 0.2)
+
         # Adjust for travel risk if significant
         if travel_risk > 0.7:
             risk_score = max(risk_score, 0.8)
 
-        # Apply reasonable bounds
+        # Bounds on risk_score
         risk_score = max(0.1, min(0.9, risk_score))
 
         logger.info(f"\nRisk Assessment Details:")
@@ -798,7 +812,7 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
         logger.info(f"Location Trust Factor: {location_trust}")
         logger.info(f"Failed Attempts Factor: {failed_attempts_factor}")
         logger.info(f"Final Risk Score: {risk_score}")
-        logger.info(f"Location Status:")
+        logger.info("Location Status:")
         logger.info(f"- Country: {country} ({'trusted' if is_trusted_country else 'untrusted'})")
         logger.info(f"- Region: {region} ({'trusted' if is_trusted_region else 'untrusted'})")
         logger.info(f"- City: {city} ({'trusted' if is_trusted_city else 'untrusted'})")
@@ -820,6 +834,7 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
             'failed_attempts_factor': 'N/A',
             'risk_score': 0.5
         }
+
 
 def prepare_and_train_model():
     global model, encoder_ip, encoder_agent, encoder_country, encoder_region, encoder_city, model_features
