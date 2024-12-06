@@ -80,11 +80,13 @@ class BehaviorTester:
 
         # Handle security question if needed
         if 'security_question' in response.url:
+            security_answer = input("Enter security answer: ")
+            add_to_trusted = input("Add to trusted locations? (y/n): ").lower() == 'y'
             response = self.session.post(
                 f'{self.base_url}/security_question',
                 data={
-                    'security_answer': self.security_answer,
-                    'add_to_trusted': self.is_training
+                    'security_answer': security_answer,
+                    'add_to_trusted': add_to_trusted
                 }
             )
             print("Answered security question")
@@ -340,10 +342,11 @@ class BehaviorTester:
 
     def answer_security_question(self, add_to_trusted=True):
         """Answer security question with option to add location to trusted"""
+        security_answer = input("Enter security answer: ")
         response = self.session.post(
             f'{self.base_url}/security_question',
             data={
-                'security_answer': self.security_answer,
+                'security_answer': security_answer,
                 'add_to_trusted': add_to_trusted
             }
         )

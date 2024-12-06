@@ -688,7 +688,7 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
     device_change_risk = 0.0
     if previous_attempt and previous_attempt.user_agent != user_agent:
         logger.info("New device detected")
-        device_change_risk = 0.3 if not trusted_device else 0.0
+        device_change_risk = 0.5 if not trusted_device else 0.0
         logger.info("Device is trusted" if trusted_device else "Device is not trusted")
 
     travel_risk, travel_details = (0.0, {})
@@ -758,7 +758,7 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
 
     try:
         X = pd.DataFrame([features])[model_features]
-        base_risk = MODEL.predict_proba(X)[0][1]
+        base_risk = max(MODEL.predict_proba(X)[0][1], 0.01)
         logger.info(f"ML model prediction: {base_risk}")
     except Exception as e:
         logger.error(f"Error in ML prediction: {str(e)}")
@@ -781,12 +781,12 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
     risk_score += device_change_risk
     risk_score += travel_risk
 
-    # If all trust factors are satisfied, drastically reduce risk
-    if is_trusted_country and is_trusted_region and is_trusted_city and device_is_trusted:
-        risk_score *= 0.5  # Drastically reduce risk
+    risk_score *= (1 - (location_trust * 0.5))
 
     # Too many failed attempts should be considered
     risk_score += failed_attempts_factor
+
+
 
     # Ensure risk stays within bounds
     risk_score = max(0.0, min(1.0, risk_score))
