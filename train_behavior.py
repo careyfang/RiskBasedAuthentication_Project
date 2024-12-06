@@ -2,10 +2,14 @@ import requests
 import time
 from datetime import datetime, timedelta
 import random
-from itertools import groupby
 import pandas as pd
 from models import LoginAttempt
 from app import calculate_travel_risk
+import logging
+
+# Setup logger
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 class BehaviorTester:
     def __init__(self):
@@ -15,8 +19,8 @@ class BehaviorTester:
         self.password = '1234'
         self.security_answer = 'bibi'
         
-        # Add simulated time tracking
-        self.current_time = datetime.now().replace(hour=9, minute=0, second=0)  # Start at 9 AM
+        # Simulated time tracking
+        self.current_time = datetime.now().replace(hour=9, minute=0, second=0, microsecond=0)  # Start at 9 AM
         
         # Normal behavior patterns
         self.usual_times = [9, 10, 11, 14, 15, 16]  # Office hours
@@ -27,33 +31,48 @@ class BehaviorTester:
             'city': 'Taipei'
         }
         
-        # Simplify user agents to just two types
+        # User agents
         self.user_agents = {
             'default_device': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
             'new_device': 'Mozilla/5.0 (Linux; Android 10; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.162 Mobile Safari/537.36'
         }
-        self.usual_device = 'default_device'  # Set default device
-        self.is_training = True
+        self.current_device = 'default_device'  # Start with default device
 
+    # =======================
+    # Helper Methods
+    # =======================
+    
     def set_location(self, location_data):
+        """Set the login location by sending a POST request."""
         response = self.session.post(
             f'{self.base_url}/test_location',
             json=location_data
         )
-        print(f"Setting location: {location_data['country']}, {location_data['city']}")
+        logger.info(f"Setting location: {location_data['country']}, {location_data['city']}")
         return response
-
+    
     def set_time(self, hour, minute=0):
-        """Set the simulated time"""
+        """Set the simulated login time."""
         self.current_time = self.current_time.replace(hour=hour, minute=minute)
+        logger.info(f"Simulated time set to: {self.current_time.strftime('%Y-%m-%d %H:%M')}")
         return self.current_time
-
+    
     def advance_day(self):
-        """Advance to next day at 9 AM"""
+        """Advance to the next day at 9 AM."""
         self.current_time += timedelta(days=1)
         self.current_time = self.current_time.replace(hour=9, minute=0)
-
+        logger.info(f"Advancing to next day: {self.current_time.strftime('%Y-%m-%d %H:%M')}")
+    
+    def set_user_agent(self, device_type):
+        """Change the user agent to simulate different devices."""
+        if device_type in self.user_agents:
+            self.current_device = device_type
+            logger.info(f"User agent set to: {device_type}")
+        else:
+            logger.warning(f"Unknown device type: {device_type}")
+    
     def login(self):
+        """Perform a login attempt with the current settings."""
         # Store last login time without modifying current_time
         self.last_login_time = self.current_time
         
@@ -62,12 +81,12 @@ class BehaviorTester:
             'username': self.username,
             'password': self.password,
             'simulated_time': self.current_time.isoformat(),
-            'user_agent': self.user_agents[self.usual_device]  # Add user agent to form data
+            'user_agent': self.user_agents[self.current_device]  # Add user agent to form data
         }
         
         # Set user agent in headers
         headers = {
-            'User-Agent': self.user_agents[self.usual_device]
+            'User-Agent': self.user_agents[self.current_device]
         }
         
         response = self.session.post(
@@ -75,273 +94,22 @@ class BehaviorTester:
             data=login_data,
             headers=headers
         )
-        print(f"Login at {self.current_time.strftime('%Y-%m-%d %H:%M')} with device: {self.usual_device}")
-        print(f"Response URL: {response.url}")
-
-        # Handle security question if needed
-        if 'security_question' in response.url:
-            security_answer = input("Enter security answer: ")
-            add_to_trusted = input("Add to trusted locations? (y/n): ").lower() == 'y'
-            response = self.session.post(
-                f'{self.base_url}/security_question',
-                data={
-                    'security_answer': security_answer,
-                    'add_to_trusted': add_to_trusted
-                }
-            )
-            print("Answered security question")
+        logger.info(f"Login at {self.current_time.strftime('%Y-%m-%d %H:%M')} with device: {self.current_device}")
+        logger.info(f"Response URL: {response.url}")
+    
+        # Handle security question if prompted
+        if '/security_question' in response.url:
+            self.handle_security_question(add_to_trusted=False)
         
-        # Handle OTP if needed
-        elif 'verify_identity' in response.url:
-            print("OTP verification required - manual intervention needed")
-            otp = input("Enter OTP from email: ")
-            response = self.session.post(
-                f'{self.base_url}/verify_identity',
-                data={'otp': otp}
-            )
-
+        # Handle OTP if prompted
+        elif '/verify_identity' in response.url:
+            self.handle_otp_verification()
+    
         return response
-
-    def check_records(self):
-        response = self.session.get(f'{self.base_url}/check_records')
-        data = response.text.split('<br>')
-        
-        # Print only the last 10 login attempts
-        print("\nRecent Login Attempts:")
-        login_attempts = [x for x in data if "Time:" in x][-10:]
-        for attempt in login_attempts:
-            print(attempt.split("Time: ")[1])
-        
-        # Print trusted locations
-        print("\nTrusted Locations:")
-        trusted = [x for x in data if "Location:" in x and "Time:" not in x]
-        for location in trusted:
-            print(location.split("Location: ")[1])
-        return response
-
-    def train_normal_behavior(self):
-        """Simulate normal login behavior over several days"""
-        print("\n=== Training Normal Behavior ===")
-        self.is_training = True  # Enable training mode
-        
-        for day in range(5):
-            print(f"\nDay {day + 1}:")
-            # Morning login
-            morning_hour = random.choice(self.usual_times[:3])
-            self.set_time(morning_hour)
-            print(f"Morning login at {self.current_time.strftime('%H:%M')}")
-            self.set_location(self.usual_location)
-            self.login()
-            time.sleep(1)
-
-            # Afternoon login
-            afternoon_hour = random.choice(self.usual_times[3:])
-            self.set_time(afternoon_hour)
-            print(f"Afternoon login at {self.current_time.strftime('%H:%M')}")
-            self.set_location(self.usual_location)
-            self.login()
-            time.sleep(1)
-
-            self.advance_day()
-
-    def test_anomalies(self):
-        """Test various anomalous behaviors"""
-        self.is_training = False
-        print("\n=== Testing Anomalies ===")
-
-        # Test 1: Unusual Time Only
-        print("\nTest 1: Unusual Time Only (3 AM) from Trusted Location")
-        self.set_location(self.usual_location)
-        self.login()
-        time.sleep(1)
-
-        # Test 2: Unusual Time + Location
-        print("\nTest 2: Unusual Time + Location")
-        unusual_location = {
-            'ip': '8.8.8.8',
-            'country': 'United States',
-            'region': 'California',
-            'city': 'Mountain View'
-        }
-        self.set_location(unusual_location)
-        self.login()
-        time.sleep(1)
-
-        # Test 3: Multiple Failed Attempts from Trusted Location
-        print("\nTest 3: Multiple Failed Attempts from Trusted Location")
-        self.set_location(self.usual_location)
-        for _ in range(3):
-            self.session.post(
-                f'{self.base_url}/login',
-                data={'username': self.username, 'password': 'wrong_password'}
-            )
-            time.sleep(1)
-        self.login()
-
-        # Test 4: Multiple Failed Attempts + Unusual Location
-        print("\nTest 4: Multiple Failed Attempts + Unusual Location")
-        self.set_location(unusual_location)
-        for _ in range(3):
-            self.session.post(
-                f'{self.base_url}/login',
-                data={'username': self.username, 'password': 'wrong_password'}
-            )
-            time.sleep(1)
-        self.login()
-
-        # Test 5: Rapid Location Changes
-        print("\nTest 5: Rapid Location Changes")
-        locations = [
-            {'ip': '1.1.1.1', 'country': 'Japan', 'region': 'Tokyo', 'city': 'Tokyo'},
-            {'ip': '2.2.2.2', 'country': 'Singapore', 'region': 'Singapore', 'city': 'Singapore'},
-            {'ip': '3.3.3.3', 'country': 'Hong Kong', 'region': 'Hong Kong', 'city': 'Hong Kong'}
-        ]
-        for location in locations:
-            self.set_location(location)
-            self.login()
-            time.sleep(1)
-
-    def test_business_trip(self):
-        """Simulate a 3-day business trip to Tokyo"""
-        print("\n=== Testing Business Trip Scenario ===")
-        
-        business_location = {
-            'ip': '203.104.248.60',
-            'country': 'Japan',
-            'region': 'Tokyo',
-            'city': 'Tokyo'
-        }
-
-        # Day 1: First login from Tokyo (should require verification)
-        print("\nDay 1 in Tokyo:")
-        print("Morning login at 9:00")
-        self.set_location(business_location)
-        self.login()  # This should trigger security question
-        time.sleep(1)
-
-        print("Afternoon login at 15:00")
-        self.set_location(business_location)
-        self.login()  # Should be easier now that location is trusted
-        time.sleep(1)
-
-        # Day 2: Regular logins from Tokyo
-        print("\nDay 2 in Tokyo:")
-        print("Morning login at 9:30")
-        self.set_location(business_location)
-        self.login()
-        time.sleep(1)
-
-        print("Afternoon login at 14:00")
-        self.set_location(business_location)
-        self.login()
-        time.sleep(1)
-
-        # Day 3: Last day in Tokyo
-        print("\nDay 3 in Tokyo:")
-        print("Morning login at 10:00")
-        self.set_location(business_location)
-        self.login()
-        time.sleep(1)
-
-        # Return home
-        print("\nReturn to home location:")
-        self.set_location(self.usual_location)
-        self.login()
-
-    def set_user_agent(self, device_type):
-        """Set the user agent for subsequent requests"""
-        if device_type in self.user_agents:
-            self.usual_device = device_type
-            print(f"Changed device to: {device_type}")
-        else:
-            print(f"Unknown device type: {device_type}")
-
-    def test_location_trust_levels(self):
-        """Test different levels of location trust"""
-        print("\n=== Testing Location Trust Levels ===")
-        
-        # Set test mode to prevent adding locations to trusted
-        self.session.post(f'{self.base_url}/set_test_mode')
-        
-        locations = {
-            'unseen_city': {
-                'ip': '1.1.1.1',
-                'country': 'Taiwan',
-                'region': 'Taipei',
-                'city': 'New Taipei'
-            },
-            'unseen_region': {
-                'ip': '1.1.1.2',
-                'country': 'Taiwan',
-                'region': 'Kaohsiung',
-                'city': 'Kaohsiung'
-            },
-            'unseen_country': {
-                'ip': '1.1.1.3',
-                'country': 'Japan',
-                'region': 'Tokyo',
-                'city': 'Tokyo'
-            }
-        }
-        
-        times = {
-            'typical': 14,
-            'unusual': 3
-        }
-        
-        # Make sure we're not in training mode
-        self.is_training = False
-        
-        base_time = self.current_time
-        
-        for time_type, hour in times.items():
-            print(f"\nTesting during {time_type} hours ({hour}:00):")
-            
-            for loc_type, location in locations.items():
-                # Reset base time for each location
-                self.current_time = base_time
-                
-                # Set initial time for this location
-                self.set_time(hour)
-                
-                # Test with default device
-                print(f"\nLogin from {loc_type} using default device")
-                self.set_location(location)
-                self.set_user_agent('default_device')
-                response = self.login()
-                
-                if '/security_question' in response.url:
-                    print(f"Login at {self.current_time} - Response URL: {response.url}")
-                    self.answer_security_question(add_to_trusted=False)
-                    print("Answered security question")
-                else:
-                    print(f"Login at {self.current_time} - Response URL: {response.url}")
-                
-                time.sleep(1)
-                
-                # Add 1 hour for next test
-                self.set_time(hour + 1)
-                
-                # Test with new device
-                print(f"\nLogin from {loc_type} using new device")
-                self.set_location(location)
-                self.set_user_agent('new_device')
-                response = self.login()
-                
-                if '/security_question' in response.url:
-                    print(f"Login at {self.current_time} - Response URL: {response.url}")
-                    self.answer_security_question(add_to_trusted=False)
-                    print("Answered security question")
-                else:
-                    print(f"Login at {self.current_time} - Response URL: {response.url}")
-                
-                time.sleep(1)
-                
-                # Advance base time by 24 hours for next location
-                base_time += timedelta(days=1)
-
-    def answer_security_question(self, add_to_trusted=True):
-        """Answer security question with option to add location to trusted"""
+    
+    def handle_security_question(self, add_to_trusted=True):
+        """Prompt user to answer security question."""
+        logger.info("Security question triggered.")
         security_answer = input("Enter security answer: ")
         response = self.session.post(
             f'{self.base_url}/security_question',
@@ -350,244 +118,253 @@ class BehaviorTester:
                 'add_to_trusted': add_to_trusted
             }
         )
+        logger.info("Answered security question.")
+        return response
+    
+    def handle_otp_verification(self):
+        """Prompt user to enter OTP code."""
+        logger.info("OTP verification required.")
+        otp = input("Enter OTP code received via email/SMS: ")
+        response = self.session.post(
+            f'{self.base_url}/verify_identity',
+            data={'otp': otp}
+        )
+        logger.info("OTP verification completed.")
+        return response
+    
+    def check_records(self):
+        """Retrieve and display recent login attempts and trusted locations."""
+        response = self.session.get(f'{self.base_url}/check_records')
+        data = response.text.split('<br>')
+        
+        # Print only the last 10 login attempts
+        logger.info("\nRecent Login Attempts:")
+        login_attempts = [x for x in data if "Time:" in x][-10:]
+        for attempt in login_attempts:
+            logger.info(attempt.split("Time: ")[1])
+        
+        # Print trusted locations
+        logger.info("\nTrusted Locations:")
+        trusted = [x for x in data if "Location:" in x and "Time:" not in x]
+        for location in trusted:
+            logger.info(location.split("Location: ")[1])
         return response
 
-    def train_initial_locations(self):
-        """Train the system with initial trusted locations"""
-        print("\n1. Training Initial Trusted Locations")
+    # =======================
+    # Training Phase
+    # =======================
+    
+    def train_normal_behavior(self):
+        """Simulate normal login behavior over several days to train the ML model."""
+        logger.info("\n=== Training Normal Behavior ===")
         
-        # Set training mode
-        self.is_training = True
-        
-        trusted_locations = [
-            {'country': 'Taiwan', 'region': 'Taipei', 'city': 'Taipei'},
-            # Add other initial trusted locations as needed
-        ]
-        
-        for location in trusted_locations:
-            print(f"\nTraining location: {location['city']}, {location['region']}, {location['country']}")
-            self.set_location({
-                'ip': '1.1.1.1',
-                **location
-            })
-            self.set_user_agent('default_device')
-            response = self.login()
+        for day in range(5):
+            logger.info(f"\nDay {day + 1}:")
+            # Morning login
+            morning_hour = random.choice(self.usual_times[:3])
+            self.set_time(morning_hour)
+            logger.info(f"Morning login at {self.current_time.strftime('%H:%M')}")
+            self.set_location(self.usual_location)
+            self.login()
+            time.sleep(1)  # Simulate time delay
             
-            if '/verify_identity' in response.url:
-                print("Verifying identity for trusted location")
-                self.verify_identity()
+            # Afternoon login
+            afternoon_hour = random.choice(self.usual_times[3:])
+            self.set_time(afternoon_hour)
+            logger.info(f"Afternoon login at {self.current_time.strftime('%H:%M')}")
+            self.set_location(self.usual_location)
+            self.login()
+            time.sleep(1)  # Simulate time delay
             
-            time.sleep(1)
-        
-        # Clear training mode
-        self.is_training = False
+            # Advance to next day
+            self.advance_day()
 
-    def test_business_trip_multiple_cities(self):
-        """Simulate a 3-day business trip with city changes and device variations"""
-        print("\n=== Testing Multi-City Business Trip ===")
-        
-        locations = {
-            'Tokyo': {
-                'ip': '203.104.248.60',
-                'country': 'Japan',
-                'region': 'Tokyo',
-                'city': 'Tokyo'
-            },
-            'Osaka': {
-                'ip': '203.104.248.61',
-                'country': 'Japan',
-                'region': 'Osaka',
-                'city': 'Osaka'
-            },
-            'Kyoto': {
-                'ip': '203.104.248.62',
-                'country': 'Japan',
-                'region': 'Kyoto',
-                'city': 'Kyoto'
-            }
+    # =======================
+    # Testing Phase: Specific Test Cases
+    # =======================
+    
+    # Test Case 1: Default device + Unseen city within the same region
+    def test_default_device_unseen_city(self):
+        logger.info("\n=== Test Case 1: Default Device + Unseen City ===")
+        unseen_city_location = {
+            'ip': '203.0.113.1',  # Example IP for testing
+            'country': 'Taiwan',
+            'region': 'Taipei',    # Same region as usual location
+            'city': 'Xindian'       # Unseen city within 'Taipei' region
+        }
+        self.set_time(random.choice(self.usual_times))
+        self.set_location(unseen_city_location)
+        self.set_user_agent('default_device')
+        self.login()
+        time.sleep(1)
+        # Advance time to ensure Test Case 2 starts after Test Case 1
+        self.advance_day()
+    
+    # Test Case 2: New device + Unseen city within the same region
+    def test_new_device_unseen_city(self):
+        logger.info("\n=== Test Case 2: New Device + Unseen City ===")
+        unseen_city_location = {
+            'ip': '203.0.113.2',
+            'country': 'Taiwan',
+            'region': 'Taipei',    # Same region as usual location
+            'city': 'Xindian'       # Unseen city within 'Taipei' region
+        }
+        self.set_time(random.choice(self.usual_times))
+        self.set_location(unseen_city_location)
+        self.set_user_agent('new_device')
+        self.login()
+        time.sleep(1)
+        # Advance time to ensure Test Case 3 starts after Test Case 2
+        self.advance_day()
+    
+    # Test Case 3: Business trip for 3 days then return home
+    def test_business_trip_then_return_home(self):
+        logger.info("\n=== Test Case 3: Business Trip for 3 Days Then Return Home ===")
+        business_trip_location = {
+            'ip': '203.0.113.3',
+            'country': 'Japan',
+            'region': 'Tokyo',
+            'city': 'Tokyo'
         }
         
-        devices = ['default_device', 'new_device']
-        
-        for city, location in locations.items():
-            print(f"\nDay in {city}:")
-            self.set_location(location)
-            for device in devices:
-                print(f"Login using {device}")
-                self.set_user_agent(device)
-                self.login()
-                time.sleep(1)
+        # Simulate 3 days in Tokyo
+        for day in range(3):
+            logger.info(f"\nBusiness Trip Day {day + 1}:")
+            # Morning login
+            morning_hour = random.choice(self.usual_times[:3])
+            self.set_time(morning_hour)
+            self.set_location(business_trip_location)
+            self.set_user_agent('default_device')
+            self.login()
+            time.sleep(1)
+            
+            # Afternoon login
+            afternoon_hour = random.choice(self.usual_times[3:])
+            self.set_time(afternoon_hour)
+            self.set_location(business_trip_location)
+            self.set_user_agent('default_device')
+            self.login()
+            time.sleep(1)
+            
+            # Advance to next day
             self.advance_day()
         
         # Return home
-        print("\nReturn to home location (using default_device)")
+        logger.info("\nReturning Home:")
+        self.set_time(random.choice(self.usual_times))
         self.set_location(self.usual_location)
         self.set_user_agent('default_device')
         self.login()
-
-    def test_time_and_location_combinations(self):
-        """Test various combinations of time and location"""
-        print("\n=== Testing Time and Location Combinations ===")
-        self.is_training = False  # Disable training mode for testing
-        
-        # Test 5: Trusted location + unusual time
-        print("\nTest: Trusted location + unusual time (2 AM)")
-        self.set_time(2)
-        self.set_location(self.usual_location)
+        time.sleep(1)
+        # Advance day after returning home
+        self.advance_day()
+    
+    # Test Case 4: Change country
+    def test_change_country(self):
+        logger.info("\n=== Test Case 4: Change Country ===")
+        new_country_location = {
+            'ip': '198.51.100.1',
+            'country': 'Singapore',
+            'region': 'Singapore',
+            'city': 'Singapore'
+        }
+        self.set_time(random.choice(self.usual_times))
+        self.set_location(new_country_location)
+        self.set_user_agent('default_device')
         self.login()
         time.sleep(1)
+        # Advance day to ensure subsequent tests start after this
+        self.advance_day()
+    
+    # Test Case 5: 3 Failed Attempts Before Entering Correct Password
+    def test_three_failed_attempts_before_success(self):
+        logger.info("\n=== Test Case 5: 3 Failed Attempts Before Correct Password ===")
+        self.set_time(random.choice(self.usual_times))
+        self.set_location(self.usual_location)
+        self.set_user_agent('default_device')
         
-        # Test 6: Untrusted location + unusual time
-        print("\nTest: Untrusted location + unusual time (3 AM)")
-        self.set_time(3)
-        unusual_location = {
-            'ip': '8.8.8.8',
-            'country': 'United States',
-            'region': 'California',
-            'city': 'Mountain View'
-        }
-        self.set_location(unusual_location)
+        # Perform 3 failed login attempts
+        for attempt in range(1, 4):
+            logger.info(f"Failed Login Attempt {attempt}: Incorrect password")
+            response = self.session.post(
+                f'{self.base_url}/login',
+                data={
+                    'username': self.username,
+                    'password': 'wrong_password',
+                    'simulated_time': self.current_time.isoformat(),
+                    'user_agent': self.user_agents[self.current_device]
+                },
+                headers={'User-Agent': self.user_agents[self.current_device]}
+            )
+            logger.info(f"Response URL: {response.url}")
+            time.sleep(1)
+        
+        # Perform correct login attempt
+        logger.info("Correct Login Attempt After Failed Attempts")
         self.login()
         time.sleep(1)
-
-    def test_failed_attempts(self):
-        """Test scenarios with failed login attempts from different devices"""
-        print("\n=== Testing Failed Attempts Scenarios ===")
+        # Advance day after testing failed attempts
+        self.advance_day()
+    
+    # Test Case 6: Rapid Location Change
+    def test_rapid_location_change(self):
+        logger.info("\n=== Test Case 6: Rapid Location Change ===")
         
-        devices = ['default_device', 'new_device']
-        
-        # Test from trusted location
-        print("\nTesting from trusted location:")
-        self.set_time(14)
-        self.set_location(self.usual_location)
-        
-        for device in devices:
-            print(f"\nAttempts using {device}")
-            self.set_user_agent(device)
-            for _ in range(2):
-                self.session.post(
-                    f'{self.base_url}/login',
-                    data={'username': self.username, 'password': 'wrong_password'}
-                )
-                time.sleep(1)
-            self.login()
-            time.sleep(1)
-        
-        # Test from unusual location
-        print("\nTesting from unusual location:")
-        unusual_location = {
-            'ip': '8.8.8.8',
-            'country': 'United States',
-            'region': 'California',
-            'city': 'Mountain View'
-        }
-        self.set_location(unusual_location)
-        
-        for device in devices:
-            print(f"\nAttempts using {device}")
-            self.set_user_agent(device)
-            for _ in range(2):
-                self.session.post(
-                    f'{self.base_url}/login',
-                    data={'username': self.username, 'password': 'wrong_password'}
-                )
-                time.sleep(1)
-            self.login()
-            time.sleep(1)
-
-    def test_rapid_location_changes(self):
-        """Test rapid changes in login location with device changes"""
-        print("\n=== Testing Rapid Location Changes ===")
-        
-        locations = [
-            {'ip': '1.1.1.1', 'country': 'Japan', 'region': 'Tokyo', 'city': 'Tokyo'},
-            {'ip': '2.2.2.2', 'country': 'Singapore', 'region': 'Singapore', 'city': 'Singapore'},
-            {'ip': '3.3.3.3', 'country': 'Hong Kong', 'region': 'Hong Kong', 'city': 'Hong Kong'},
-            {'ip': '4.4.4.4', 'country': 'South Korea', 'region': 'Seoul', 'city': 'Seoul'}
+        rapid_locations = [
+            {'ip': '203.0.113.4', 'country': 'Japan', 'region': 'Osaka', 'city': 'Osaka'},
+            {'ip': '203.0.113.5', 'country': 'Hong Kong', 'region': 'Hong Kong', 'city': 'Hong Kong'},
+            {'ip': '203.0.113.6', 'country': 'South Korea', 'region': 'Seoul', 'city': 'Seoul'},
+            {'ip': '203.0.113.7', 'country': 'United States', 'region': 'California', 'city': 'San Francisco'}
         ]
         
-        devices = ['default_device', 'new_device']
+        self.set_user_agent('default_device')
         
-        self.set_time(14)
-        for location, device in zip(locations, devices):
-            print(f"\nLogin from {location['country']}, {location['city']} using {device}")
-            self.set_location(location)
-            self.set_user_agent(device)
+        for loc in rapid_locations:
+            self.set_time(random.choice(self.usual_times))
+            self.set_location(loc)
             self.login()
             time.sleep(1)
-
-    def run_full_test(self):
-        """Run complete behavior training and anomaly testing"""
-        print("\n=== Starting Full Test Suite ===")
+            # Advance time slightly to prevent exact same timestamps
+            if self.current_time.hour < 23:
+                self.set_time(self.current_time.hour + 1)
+            else:
+                self.set_time(0)
+                self.advance_day()
         
-        # First, train normal behavior
-        self.train_normal_behavior()  # is_training = True
+        # Advance day after rapid location changes
+        self.advance_day()
+    
+    # =======================
+    # Test Execution
+    # =======================
+    
+    def run_tests(self):
+        """Run all defined test cases sequentially."""
+        logger.info("\n=== Starting Test Suite ===")
+        
+        # Execute Test Cases in Order
+        self.test_default_device_unseen_city()
+        self.test_new_device_unseen_city()
+        self.test_business_trip_then_return_home()
+        self.test_change_country()
+        self.test_three_failed_attempts_before_success()
+        self.test_rapid_location_change()
+        
+        # Final record check
+        logger.info("\n=== Final Record Check ===")
         self.check_records()
         
-        # Run all test cases with is_training = False
-        self.test_location_trust_levels()
-        
-        print("\n3. Testing Business Trip Scenario")
-        self.test_business_trip_multiple_cities()
-        
-        print("\n4. Testing Time and Location Combinations")
-        self.test_time_and_location_combinations()
-        
-        print("\n5. Testing Failed Attempts with Different Devices")
-        self.test_failed_attempts()
-        
-        print("\n6. Testing Rapid Location and Device Changes")
-        self.test_rapid_location_changes()
-        
-        # Final check of records
-        print("\n=== Final Record Check ===")
-        self.check_records()
-        
-        print("\n=== Full Test Suite Completed ===")
+        logger.info("\n=== Test Suite Completed ===")
 
-    def prepare_training_data():
-        attempts = LoginAttempt.query.order_by(LoginAttempt.login_time).all()
-        data = []
-        
-        for user_id, user_attempts in groupby(attempts, key=lambda x: x.user_id):
-            user_attempts = list(user_attempts)  # Convert iterator to list
-            
-            for i, attempt in enumerate(user_attempts):
-                # Get previous attempt for travel risk calculation
-                prev_attempt = user_attempts[i-1] if i > 0 else None
-                
-                if prev_attempt:
-                    # Calculate time difference in hours
-                    time_diff = (attempt.login_time - prev_attempt.login_time).total_seconds() / 3600
-                    
-                    # Calculate travel risk
-                    prev_location = {
-                        'city': prev_attempt.city,
-                        'region': prev_attempt.region,
-                        'country': prev_attempt.country
-                    }
-                    curr_location = {
-                        'city': attempt.city,
-                        'region': attempt.region,
-                        'country': attempt.country
-                    }
-                    
-                    travel_risk, _ = calculate_travel_risk(prev_location, curr_location, time_diff)
-                else:
-                    travel_risk = 0.0
-                    time_diff = 0.0
-                
-                # Add time-based features
-                data.append({
-                    'user_id': attempt.user_id,
-                    'time_since_last_login': time_diff,
-                    'travel_risk': travel_risk,
-                    'label': attempt.label,
-                    # ... other features ...
-                })
-        
-        return pd.DataFrame(data)
+# =======================
+# Main Execution
+# =======================
 
 if __name__ == "__main__":
     tester = BehaviorTester()
-    tester.run_full_test() 
+    
+    # Step 1: Train normal behavior
+    tester.train_normal_behavior()
+    
+    # Step 2: Run test cases
+    tester.run_tests()
