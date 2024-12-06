@@ -40,18 +40,17 @@ app.config['MAIL_USE_TLS'] = True
 app.config['MAIL_USERNAME'] = os.environ.get('MAIL_USERNAME')
 app.config['MAIL_PASSWORD'] = os.environ.get('MAIL_PASSWORD')
 
+# Initialize extensions
 db.init_app(app)
 migrate = Migrate(app, db)
 mail = Mail(app)
 serializer = URLSafeTimedSerializer(app.secret_key)
 
+# Initialize global variables
 model = None
-encoder_ip = LabelEncoder()
-encoder_agent = LabelEncoder()
-encoder_country = LabelEncoder()
-encoder_region = LabelEncoder()
-encoder_city = LabelEncoder()
-encoder_agent_type = LabelEncoder()
+model_features = []
+encoders = {}
+MODEL = None  # Will hold the entire ML pipeline
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -60,16 +59,18 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(BASE_DIR, 'models')
 MODEL_PATH = os.path.join(MODEL_DIR, 'model.joblib')
 ENCODERS_PATH = os.path.join(MODEL_DIR, 'encoders.joblib')
+MODEL_FEATURES_PATH = os.path.join(MODEL_DIR, 'model_features.joblib')
 
 geolocator = Nominatim(user_agent="rba_application")
 LOCATION_CACHE = {}
 
-def safe_encode(encoder, value):
+def safe_encode(feature, value):
+    """Safely encode a feature using the corresponding encoder."""
     try:
-        return encoder.transform([value])[0]
+        return encoders[feature].transform([value])[0]
     except:
         try:
-            return encoder.transform(['Unknown'])[0]
+            return encoders[feature].transform(['Unknown'])[0]
         except:
             return 0
 
@@ -241,7 +242,8 @@ def add_to_trusted_locations(user_id, login_attempt):
             city=login_attempt.city
         ).first()
 
-        if not existing_location and all(x not in [None, 'Unknown', 'Local'] for x in [login_attempt.country, login_attempt.region, login_attempt.city]):
+        # Allow 'Local' to be added as a trusted location
+        if not existing_location and all(x not in [None, 'Unknown'] for x in [login_attempt.country, login_attempt.region, login_attempt.city]):
             new_location = TrustedLocation(
                 user_id=user_id,
                 country=login_attempt.country,
@@ -322,6 +324,7 @@ def login():
             login_count = LoginAttempt.query.filter_by(user_id=user.id).count()
 
             if login_count == 0:
+                # First login attempt, trust the location and device
                 login_attempt = LoginAttempt(
                     user_id=user.id,
                     ip_address=ip_address,
@@ -332,6 +335,9 @@ def login():
                     country=country,
                     region=region,
                     city=city,
+                    is_trusted_country=1 if country in ['Taiwan', 'Local'] else 0,
+                    is_trusted_region=1 if region in ['Taipei', 'Local'] else 0,
+                    is_trusted_city=1 if city in ['Taipei', 'Local'] else 0,
                     label=0
                 )
                 db.session.add(login_attempt)
@@ -397,6 +403,9 @@ def login():
                 country=country if country else 'Unknown',
                 region=region if region else 'Unknown',
                 city=city if city else 'Unknown',
+                is_trusted_country=risk_results.get('is_trusted_country', 0),
+                is_trusted_region=risk_results.get('is_trusted_region', 0),
+                is_trusted_city=risk_results.get('is_trusted_city', 0),
                 label=label_attempt(user.id, ip_address, user_agent, country, region, city)
             )
             db.session.add(login_attempt)
@@ -523,7 +532,7 @@ def verify_identity():
             except Exception as e:
                 flash('Failed to send OTP. Please try again.', 'error')
                 return render_template('verify_identity.html')
-    
+
     return render_template('verify_identity.html')
 
 def get_user_typical_hours(user_id):
@@ -551,6 +560,10 @@ def label_attempt(user_id, ip_address, user_agent, country, region, city):
     trusted_regions = set(tl.region for tl in trusted_locations)
     trusted_cities = set(tl.city for tl in trusted_locations)
 
+    # If the current location is entirely 'Local', treat it as trusted
+    if country == 'Local' and region == 'Local' and city == 'Local':
+        return 0  # Treat 'Local' as normal
+
     # Define anomaly only if multiple conditions are met
     anomaly_conditions = [
         country not in trusted_countries,
@@ -563,7 +576,6 @@ def label_attempt(user_id, ip_address, user_agent, country, region, city):
     if sum(anomaly_conditions) >= 2:
         return 1
     return 0
-
 
 def calculate_travel_risk(previous_location, current_location, time_difference_hours):
     if not previous_location or not current_location:
@@ -593,7 +605,7 @@ def calculate_travel_risk(previous_location, current_location, time_difference_h
             return 0.0, {"error": "Coordinates not found"}
 
         distance = geodesic(coords1, coords2).miles
-        MIN_TIME = 0.016667
+        MIN_TIME = 0.016667  # Approximately 1 minute
 
         if time_difference_hours < MIN_TIME and distance > 0:
             required_speed = distance / MIN_TIME
@@ -639,33 +651,32 @@ def calculate_travel_risk(previous_location, current_location, time_difference_h
         return 0.0, {"error": str(e)}
 
 def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, user, prev_location=None, current_location=None, time_diff_hours=0.0):
-    global model, encoder_ip, encoder_agent, encoder_country, encoder_region, encoder_city, encoder_agent_type, model_features
+    global MODEL, model_features, encoders
 
-    if not os.path.exists(ENCODERS_PATH) or not os.path.exists(MODEL_PATH):
-        logger.warning("Encoders or model not found, returning default risk assessment")
+    if not os.path.exists(ENCODERS_PATH) or not os.path.exists(MODEL_PATH) or not os.path.exists(MODEL_FEATURES_PATH):
+        logger.warning("Encoders, model, or model features not found, returning default risk assessment")
         return {
             'base_ml_risk_score': 0.3,
             'device_change_risk': 0.0,
+            'travel_risk': 0.0,
             'location_trust_factor': 1.0,
             'failed_attempts_factor': 0.0,
             'risk_score': 0.3
         }
 
     try:
-        encoders = joblib.load(ENCODERS_PATH)
-        encoder_ip = encoders['encoder_ip']
-        encoder_agent = encoders['encoder_agent']
-        encoder_country = encoders['encoder_country']
-        encoder_region = encoders['encoder_region']
-        encoder_city = encoders['encoder_city']
-        encoder_agent_type = encoders['encoder_agent_type']
-        model_features_dict = joblib.load(os.path.join(MODEL_DIR, 'model_features.joblib'))
-        model_features = model_features_dict['model_features']
+        if MODEL is None:
+            MODEL = joblib.load(MODEL_PATH)  # Load the entire pipeline
+            encoders = joblib.load(ENCODERS_PATH)
+            model_features_dict = joblib.load(MODEL_FEATURES_PATH)
+            model_features = model_features_dict['model_features']
+            logger.info("Model pipeline and encoders loaded successfully")
     except Exception as e:
-        logger.error(f"Failed to load encoders or model features: {e}")
+        logger.error(f"Failed to load model pipeline or encoders: {e}")
         return {
             'base_ml_risk_score': 0.3,
             'device_change_risk': 0.0,
+            'travel_risk': 0.0,
             'location_trust_factor': 1.0,
             'failed_attempts_factor': 0.0,
             'risk_score': 0.3
@@ -723,6 +734,7 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
     # Derive user_agent_type and encode it
     user_agent_type = categorize_user_agent(user_agent)
 
+    # Encode categorical features
     features = {
         'failed_attempts': user.failed_attempts,
         'failed_attempts_24h': failed_attempts_24h,
@@ -733,12 +745,12 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
         'time_anomaly': time_anomaly,
         'hour': login_time.hour,
         'day_of_week': login_time.weekday(),
-        'ip_address_encoded': safe_encode(encoder_ip, ip_address),
-        'user_agent_encoded': safe_encode(encoder_agent, user_agent),
-        'country_encoded': safe_encode(encoder_country, country),
-        'region_encoded': safe_encode(encoder_region, region),
-        'city_encoded': safe_encode(encoder_city, city),
-        'user_agent_type_encoded': safe_encode(encoder_agent_type, user_agent_type),
+        'ip_address_encoded': safe_encode('encoder_ip', ip_address),
+        'user_agent_encoded': safe_encode('encoder_agent', user_agent),
+        'country_encoded': safe_encode('encoder_country', country),
+        'region_encoded': safe_encode('encoder_region', region),
+        'city_encoded': safe_encode('encoder_city', city),
+        'user_agent_type_encoded': safe_encode('encoder_agent_type', user_agent_type),
         'is_trusted_country': is_trusted_country,
         'is_trusted_region': is_trusted_region,
         'is_trusted_city': is_trusted_city
@@ -746,7 +758,7 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
 
     try:
         X = pd.DataFrame([features])[model_features]
-        base_risk = model.predict_proba(X)[0][1]
+        base_risk = MODEL.predict_proba(X)[0][1]
         logger.info(f"ML model prediction: {base_risk}")
     except Exception as e:
         logger.error(f"Error in ML prediction: {str(e)}")
@@ -766,13 +778,15 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
 
     # Adjust the final risk score
     risk_score = base_risk
-    risk_score += device_change_risk * 0.2
-    risk_score += travel_risk * 0.1  # Reduced weight
-    risk_score += failed_attempts_factor
+    risk_score += device_change_risk
+    risk_score += travel_risk
 
     # If all trust factors are satisfied, drastically reduce risk
     if is_trusted_country and is_trusted_region and is_trusted_city and device_is_trusted:
-        risk_score *= 0.1  # Drastically reduce risk
+        risk_score *= 0.5  # Drastically reduce risk
+
+    # Too many failed attempts should be considered
+    risk_score += failed_attempts_factor
 
     # Ensure risk stays within bounds
     risk_score = max(0.0, min(1.0, risk_score))
@@ -785,12 +799,14 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
         'travel_risk': travel_risk,
         'location_trust_factor': location_trust,
         'failed_attempts_factor': failed_attempts_factor,
-        'risk_score': risk_score
+        'risk_score': risk_score,
+        'is_trusted_country': is_trusted_country,
+        'is_trusted_region': is_trusted_region,
+        'is_trusted_city': is_trusted_city
     }
 
-
 def prepare_and_train_model():
-    global model, encoder_ip, encoder_agent, encoder_country, encoder_region, encoder_city, encoder_agent_type, model_features
+    global MODEL, model_features, encoders
 
     attempts = LoginAttempt.query.all()
     if not attempts:
@@ -799,7 +815,7 @@ def prepare_and_train_model():
 
     data = []
     for attempt in attempts:
-        user = db.session.get(User, attempt.user_id)  # Updated to use db.session.get()
+        user = db.session.get(User, attempt.user_id)
         if not user:
             continue
 
@@ -852,7 +868,7 @@ def prepare_and_train_model():
     # Initialize encoders with consistent keys
     encoders = {}
     encoder_key_map = {
-        'ip_address': 'encoder_ip',        # Changed from 'encoder_ip_address' to 'encoder_ip'
+        'ip_address': 'encoder_ip',
         'user_agent': 'encoder_agent',
         'country': 'encoder_country',
         'region': 'encoder_region',
@@ -946,41 +962,33 @@ def prepare_and_train_model():
     logger.info(f"Validation F1 Score: {search.score(X_val, y_val):.4f}")
     logger.info(f"Classification Report:\n{classification_report(y_val, y_pred)}")
 
-    # Save the best model
-    best_model = search.best_estimator_
-    model = best_model.named_steps['gbm']  # Extract the GBM model
+    # Save the entire pipeline
+    best_pipeline = search.best_estimator_
 
     os.makedirs(MODEL_DIR, exist_ok=True)
-    joblib.dump(model, MODEL_PATH)
+    joblib.dump(best_pipeline, MODEL_PATH)  # Save the entire pipeline
     joblib.dump(encoders, ENCODERS_PATH)
 
     # Save model features
-    joblib.dump({'model_features': model_features}, os.path.join(MODEL_DIR, 'model_features.joblib'))
+    joblib.dump({'model_features': model_features}, MODEL_FEATURES_PATH)
 
     logger.info("Model training completed successfully with improvements.")
 
 def init_model():
-    global model, encoder_ip, encoder_agent, encoder_country, encoder_region, encoder_city, encoder_agent_type, model_features
+    global MODEL, model_features, encoders
     try:
-        if os.path.exists(MODEL_PATH) and os.path.exists(ENCODERS_PATH) and os.path.exists(os.path.join(MODEL_DIR, 'model_features.joblib')):
-            model = joblib.load(MODEL_PATH)
+        if os.path.exists(MODEL_PATH) and os.path.exists(ENCODERS_PATH) and os.path.exists(MODEL_FEATURES_PATH):
+            MODEL = joblib.load(MODEL_PATH)
             encoders = joblib.load(ENCODERS_PATH)
-            encoder_ip = encoders['encoder_ip']
-            encoder_agent = encoders['encoder_agent']
-            encoder_country = encoders['encoder_country']
-            encoder_region = encoders['encoder_region']
-            encoder_city = encoders['encoder_city']
-            encoder_agent_type = encoders['encoder_agent_type']
-            model_features_dict = joblib.load(os.path.join(MODEL_DIR, 'model_features.joblib'))
+            model_features_dict = joblib.load(MODEL_FEATURES_PATH)
             model_features = model_features_dict['model_features']
-            logger.info("Model and encoders loaded successfully")
+            logger.info("Model pipeline and encoders loaded successfully")
         else:
             logger.info("No existing model or encoders found, training a new one...")
             prepare_and_train_model()
     except Exception as e:
         logger.error(f"Error loading model or encoders: {e}")
         prepare_and_train_model()
-
 
 def generate_synthetic_attempts(num_samples):
     synthetic_data = []
@@ -996,29 +1004,56 @@ def generate_synthetic_attempts(num_samples):
 
         if is_anomalous:
             # Generate anomalous attempt
-            user_agent = random.choice(['unknown_device'] + common_user_agents)
+            # Randomly decide if the anomaly is due to location or user agent or both
+            anomaly_type = random.choice(['location', 'user_agent', 'both'])
+            if anomaly_type == 'location':
+                country = random.choice(['Japan', 'Singapore', 'Unknown'])  # Untrusted locations
+                region = 'Unknown'
+                city = 'Unknown'
+                user_agent = random.choice(common_user_agents)
+            elif anomaly_type == 'user_agent':
+                country = 'Taiwan'
+                region = 'Taipei'
+                city = 'Taipei'
+                user_agent = 'unknown_device'
+            else:  # both
+                country = random.choice(['Japan', 'Singapore', 'Unknown'])
+                region = 'Unknown'
+                city = 'Unknown'
+                user_agent = 'unknown_device'
+            
             hour = random.choice([random.randint(0, 5), random.randint(20, 23)])  # Unusual hours
             is_typical_hour = 0
-            country = random.choice(['Japan', 'Singapore', 'Unknown'])  # Untrusted locations
-            region = 'Unknown'
-            city = 'Unknown'
             failed_attempts = random.randint(3, 5)
             failed_attempts_24h = failed_attempts + random.randint(1, 3)
             unique_ips_24h = random.randint(3, 5)
             unique_locations_24h = random.randint(3, 5)
+            is_trusted_country = 0  # Untrusted
+            is_trusted_region = 0
+            is_trusted_city = 0
         else:
             # Generate normal attempt
+            # Including possible 'Local' logins as trusted
+            location_type = random.choice(['trusted', 'local'])
+            if location_type == 'trusted':
+                country = 'Taiwan'
+                region = 'Taipei'
+                city = 'Taipei'
+            else:
+                country = 'Local'
+                region = 'Local'
+                city = 'Local'
             user_agent = 'default_device'
             hour = random.choice([9, 10, 11, 14, 15, 16])  # Typical office hours
             is_typical_hour = 1
-            country = 'Taiwan'
-            region = 'Taipei'
-            city = 'Taipei'
             failed_attempts = random.randint(0, 2)
             failed_attempts_24h = failed_attempts
             unique_ips_24h = random.randint(1, 2)
             unique_locations_24h = random.randint(1, 2)
-        
+            is_trusted_country = 1  # Trusted
+            is_trusted_region = 1
+            is_trusted_city = 1
+
         # Build sample
         sample = {
             'user_id': user_id,
@@ -1035,9 +1070,9 @@ def generate_synthetic_attempts(num_samples):
             'failed_attempts_24h': failed_attempts_24h,
             'unique_ips_24h': unique_ips_24h,
             'unique_locations_24h': unique_locations_24h,
-            'is_trusted_country': 1 if country == 'Taiwan' else 0,
-            'is_trusted_region': 1 if region == 'Taipei' else 0,
-            'is_trusted_city': 1 if city == 'Taipei' else 0,
+            'is_trusted_country': is_trusted_country,  # Set new fields
+            'is_trusted_region': is_trusted_region,
+            'is_trusted_city': is_trusted_city,
             'time_anomaly': 1 - is_typical_hour,
             'label': is_anomalous
         }
@@ -1141,7 +1176,7 @@ def get_cached_coords(city, region, country):
                     LOCATION_CACHE[location_key] = coords
                     logger.info(f"Retrieved coordinates for {loc_str}: {coords}")
                     return coords
-                time.sleep(1)
+                time.sleep(1)  # To respect usage limits
             except (GeocoderTimedOut, GeocoderUnavailable) as e:
                 logger.warning(f"Geocoding failed for {loc_str}: {e}")
                 continue
@@ -1187,6 +1222,9 @@ def initialize_data():
                 country=entry['country'],
                 region=entry['region'],
                 city=entry['city'],
+                is_trusted_country=entry['is_trusted_country'],
+                is_trusted_region=entry['is_trusted_region'],
+                is_trusted_city=entry['is_trusted_city'],
                 label=entry['label']
             )
             db.session.add(login_attempt)
@@ -1218,7 +1256,6 @@ def initialize_data():
         db.session.rollback()
         logger.error(f"Error initializing data: {e}")
         return jsonify({'status': 'error', 'message': str(e)})
-
 
 if __name__ == '__main__':
     with app.app_context():
