@@ -804,7 +804,7 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
             risk_score *= 0.5
 
         # Add failed attempts influence
-        risk_score += (failed_attempts_factor * 0.2)
+        risk_score += (failed_attempts_factor * 0.3)
 
         # Adjust for travel risk if significant
         if travel_risk > 0.7:
