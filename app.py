@@ -626,12 +626,15 @@ def calculate_travel_risk(previous_location, current_location, time_difference_h
         if required_speed > 600:
             risk_score = 1.0
             travel_details["assessment"] = "Impossible travel detected"
-        elif required_speed > 550:
+        elif required_speed > 500:
             risk_score = 0.7
             travel_details["assessment"] = "Suspicious travel speed"
-        elif distance > 100:
-            risk_score = 0.3
-            travel_details["assessment"] = "Long distance but feasible"
+        elif required_speed > 150 and distance < 50:
+            risk_score = 0.4
+            travel_details["assessment"] = "Fast speed over short distance"
+        elif required_speed > 80:
+            risk_score = 0.1
+            travel_details["assessment"] = "Fast but possible"
         else:
             risk_score = 0.0
             travel_details["assessment"] = "Normal travel distance"
