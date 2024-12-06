@@ -26,6 +26,7 @@ from sklearn.model_selection import train_test_split, RandomizedSearchCV
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.pipeline import Pipeline
 from scipy.stats import uniform, randint
+from flask_migrate import Migrate
 
 app = Flask(__name__)
 app.secret_key = 'your_secret_key'  # Replace with a secure, random key
@@ -40,6 +41,7 @@ app.config['MAIL_USERNAME'] = os.environ.get('MAIL_USERNAME')
 app.config['MAIL_PASSWORD'] = os.environ.get('MAIL_PASSWORD')
 
 db.init_app(app)
+migrate = Migrate(app, db)
 mail = Mail(app)
 serializer = URLSafeTimedSerializer(app.secret_key)
 
@@ -212,8 +214,6 @@ def security_question():
                 add_to_trusted_devices(user_id, login_attempt.user_agent)
                 db.session.commit()
                 logger.info(f"Security question verified for user {user.username}")
-                # Removed frequent retraining here
-                # prepare_and_train_model()
 
             user.failed_attempts = 0
             db.session.commit()
@@ -489,8 +489,6 @@ def verify_identity():
                     add_to_trusted_devices(user_id, login_attempt.user_agent)
                     db.session.commit()
                     logger.info(f"Verification successful for user {user.username}")
-                    # Removed frequent retraining here
-                    # prepare_and_train_model()
 
                 if user:
                     user.failed_attempts = 0
@@ -546,16 +544,26 @@ def get_user_typical_hours(user_id):
 def label_attempt(user_id, ip_address, user_agent, country, region, city):
     previous_attempts = LoginAttempt.query.filter_by(user_id=user_id, label=0).all()
     if not previous_attempts:
-        return 0
+        return 0  # Default to normal if no history
 
     trusted_locations = TrustedLocation.query.filter_by(user_id=user_id).all()
-    trusted_countries = set(loc.country for loc in trusted_locations)
-    trusted_regions = set(loc.region for loc in trusted_locations)
-    trusted_cities = set(loc.city for loc in trusted_locations)
+    trusted_countries = set(tl.country for tl in trusted_locations)
+    trusted_regions = set(tl.region for tl in trusted_locations)
+    trusted_cities = set(tl.city for tl in trusted_locations)
 
-    if (country not in trusted_countries or region not in trusted_regions or city not in trusted_cities):
+    # Define anomaly only if multiple conditions are met
+    anomaly_conditions = [
+        country not in trusted_countries,
+        region not in trusted_regions,
+        city not in trusted_cities,
+        user_agent not in [td.user_agent for td in TrustedDevice.query.filter_by(user_id=user_id).all()]
+    ]
+
+    # An anomaly is only if at least two conditions are met
+    if sum(anomaly_conditions) >= 2:
         return 1
     return 0
+
 
 def calculate_travel_risk(previous_location, current_location, time_difference_hours):
     if not previous_location or not current_location:
@@ -633,8 +641,8 @@ def calculate_travel_risk(previous_location, current_location, time_difference_h
 def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, user, prev_location=None, current_location=None, time_diff_hours=0.0):
     global model, encoder_ip, encoder_agent, encoder_country, encoder_region, encoder_city, encoder_agent_type, model_features
 
-    if not os.path.exists(ENCODERS_PATH):
-        logger.warning("Encoders not found, returning default risk assessment")
+    if not os.path.exists(ENCODERS_PATH) or not os.path.exists(MODEL_PATH):
+        logger.warning("Encoders or model not found, returning default risk assessment")
         return {
             'base_ml_risk_score': 0.3,
             'device_change_risk': 0.0,
@@ -651,10 +659,10 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
         encoder_region = encoders['encoder_region']
         encoder_city = encoders['encoder_city']
         encoder_agent_type = encoders['encoder_agent_type']
-        model_features = encoders['model_features']
-
+        model_features_dict = joblib.load(os.path.join(MODEL_DIR, 'model_features.joblib'))
+        model_features = model_features_dict['model_features']
     except Exception as e:
-        logger.error(f"Failed to load encoders: {e}")
+        logger.error(f"Failed to load encoders or model features: {e}")
         return {
             'base_ml_risk_score': 0.3,
             'device_change_risk': 0.0,
@@ -699,6 +707,9 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
     is_trusted_region = 1 if region in trusted_regions else 0
     is_trusted_city = 1 if city in trusted_cities else 0
 
+    # Also consider device trust
+    device_is_trusted = 1 if trusted_device else 0
+
     location_trust = 0.0
     if is_trusted_country:
         location_trust += 0.5
@@ -707,7 +718,7 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
     if is_trusted_city:
         location_trust += 0.2
 
-    failed_attempts_factor = min(user.failed_attempts * 0.15, 0.75)
+    failed_attempts_factor = min(user.failed_attempts * 0.1, 0.3)
 
     # Derive user_agent_type and encode it
     user_agent_type = categorize_user_agent(user_agent)
@@ -727,39 +738,56 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
         'country_encoded': safe_encode(encoder_country, country),
         'region_encoded': safe_encode(encoder_region, region),
         'city_encoded': safe_encode(encoder_city, city),
+        'user_agent_type_encoded': safe_encode(encoder_agent_type, user_agent_type),
         'is_trusted_country': is_trusted_country,
         'is_trusted_region': is_trusted_region,
-        'is_trusted_city': is_trusted_city,
-        'user_agent_type_encoded': safe_encode(encoder_agent_type, user_agent_type)
+        'is_trusted_city': is_trusted_city
     }
 
-    if model is None or not os.path.exists(MODEL_PATH):
-        logger.warning("Model not found, returning default risk assessment")
+    try:
+        X = pd.DataFrame([features])[model_features]
+        base_risk = model.predict_proba(X)[0][1]
+        logger.info(f"ML model prediction: {base_risk}")
+    except Exception as e:
+        logger.error(f"Error in ML prediction: {str(e)}")
         base_risk = 0.3
-    else:
-        try:
-            X = pd.DataFrame([features])[model_features]
-            # Convert DataFrame to numpy array to avoid feature names warning
-            X_array = X.to_numpy()
-            base_risk = model.predict_proba(X_array)[0][1]
-            logger.info(f"ML model prediction: {base_risk}")
-        except Exception as e:
-            logger.error(f"Error in ML prediction: {str(e)}")
-            base_risk = 0.3
 
-    # Simplified risk score calculation
+    logger.info("\nRisk Assessment Details:")
+    logger.info(f"Base ML Risk Score: {base_risk}")
+    logger.info(f"Device Change Risk: {device_change_risk}")
+    logger.info(f"Travel Risk: {travel_risk}")
+    logger.info(f"Location Trust Factor: {location_trust}")
+    logger.info(f"Failed Attempts Factor: {failed_attempts_factor}")
+    logger.info("Location Status:")
+    logger.info(f"- Country: {country} ({'trusted' if is_trusted_country else 'not trusted'})")
+    logger.info(f"- Region: {region} ({'trusted' if is_trusted_region else 'not trusted'})")
+    logger.info(f"- City: {city} ({'trusted' if is_trusted_city else 'not trusted'})")
+    logger.info(f"Device Trusted: {'Yes' if device_is_trusted else 'No'}")
+
+    # Adjust the final risk score
     risk_score = base_risk
     risk_score += device_change_risk * 0.2
-    risk_score += travel_risk * 0.3
+    risk_score += travel_risk * 0.1  # Reduced weight
+    risk_score += failed_attempts_factor
+
+    # If all trust factors are satisfied, drastically reduce risk
+    if is_trusted_country and is_trusted_region and is_trusted_city and device_is_trusted:
+        risk_score *= 0.1  # Drastically reduce risk
+
+    # Ensure risk stays within bounds
     risk_score = max(0.0, min(1.0, risk_score))
+
+    logger.info(f"Final Risk Score: {risk_score}")
 
     return {
         'base_ml_risk_score': base_risk,
         'device_change_risk': device_change_risk,
+        'travel_risk': travel_risk,
         'location_trust_factor': location_trust,
         'failed_attempts_factor': failed_attempts_factor,
         'risk_score': risk_score
     }
+
 
 def prepare_and_train_model():
     global model, encoder_ip, encoder_agent, encoder_country, encoder_region, encoder_city, encoder_agent_type, model_features
@@ -771,7 +799,7 @@ def prepare_and_train_model():
 
     data = []
     for attempt in attempts:
-        user = db.session.get(User, attempt.user_id)
+        user = db.session.get(User, attempt.user_id)  # Updated to use db.session.get()
         if not user:
             continue
 
@@ -803,6 +831,9 @@ def prepare_and_train_model():
             'country': attempt.country if attempt.country else 'Unknown',
             'region': attempt.region if attempt.region else 'Unknown',
             'city': attempt.city if attempt.city else 'Unknown',
+            'is_trusted_country': attempt.is_trusted_country,
+            'is_trusted_region': attempt.is_trusted_region,
+            'is_trusted_city': attempt.is_trusted_city,
             'label': attempt.label
         })
 
@@ -812,14 +843,30 @@ def prepare_and_train_model():
 
     df = pd.DataFrame(data)
 
+    # Derive user_agent_type
     df['user_agent_type'] = df['user_agent'].apply(categorize_user_agent)
 
+    # Define categorical features
     categorical_features = ['ip_address', 'user_agent', 'country', 'region', 'city', 'user_agent_type']
+    
+    # Initialize encoders with consistent keys
+    encoders = {}
+    encoder_key_map = {
+        'ip_address': 'encoder_ip',        # Changed from 'encoder_ip_address' to 'encoder_ip'
+        'user_agent': 'encoder_agent',
+        'country': 'encoder_country',
+        'region': 'encoder_region',
+        'city': 'encoder_city',
+        'user_agent_type': 'encoder_agent_type'
+    }
     for feature in categorical_features:
         encoder = LabelEncoder()
+        # Fit on all possible values including 'Unknown'
+        df[feature] = df[feature].fillna('Unknown')
         df[f'{feature}_encoded'] = encoder.fit_transform(df[feature])
-        globals()[f'encoder_{feature.split("_")[0]}'] = encoder
+        encoders[encoder_key_map[feature]] = encoder  # Use mapped keys
 
+    # Define model features including trust factors
     model_features = [
         'failed_attempts',
         'failed_attempts_24h',
@@ -835,79 +882,87 @@ def prepare_and_train_model():
         'country_encoded',
         'region_encoded',
         'city_encoded',
-        'user_agent_type_encoded'
+        'user_agent_type_encoded',
+        'is_trusted_country',
+        'is_trusted_region',
+        'is_trusted_city'
     ]
 
     X = df[model_features]
     y = df['label']
 
-    unique_classes = np.unique(y)
-    if len(unique_classes) < 2:
-        logger.warning("Only one class present. Skipping model training.")
-        return
+    # Check class balance
+    class_counts = y.value_counts()
+    logger.info(f"Class distribution before SMOTE: {class_counts.to_dict()}")
 
-    smote = SMOTE(random_state=42, k_neighbors=1)
-    X_balanced, y_balanced = smote.fit_resample(X, y)
+    # Apply SMOTE to handle class imbalance (if necessary)
+    if class_counts.min() < 50:  # Arbitrary threshold; adjust as needed
+        smote = SMOTE(random_state=42)
+        X_balanced, y_balanced = smote.fit_resample(X, y)
+        logger.info(f"Class distribution after SMOTE: {pd.Series(y_balanced).value_counts().to_dict()}")
+    else:
+        X_balanced, y_balanced = X, y
 
-    unique_classes_resampled = np.unique(y_balanced)
-    if len(unique_classes_resampled) < 2:
-        logger.warning("After SMOTE, still only one class. Skipping model training.")
-        return
+    # Split the data
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_balanced, y_balanced, test_size=0.2, random_state=42, stratify=y_balanced
+    )
 
-    X_train, X_val, y_train, y_val = train_test_split(X_balanced, y_balanced, test_size=0.2, random_state=42)
-
+    # Define the pipeline
     pipeline = Pipeline([
         ('scaler', StandardScaler()),
         ('gbm', GradientBoostingClassifier(random_state=42))
     ])
 
+    # Define hyperparameter distributions
     param_dist = {
-        'gbm__n_estimators': randint(50, 300),
-        'gbm__max_depth': randint(2, 10),
+        'gbm__n_estimators': randint(100, 500),
+        'gbm__max_depth': randint(3, 10),
         'gbm__learning_rate': uniform(0.01, 0.2),
         'gbm__subsample': uniform(0.7, 0.3)
     }
 
+    # Perform randomized search
     search = RandomizedSearchCV(
         pipeline,
         param_distributions=param_dist,
         n_iter=20,
-        scoring='f1', 
+        scoring='f1',
         cv=3,
         random_state=42,
-        verbose=1
+        verbose=1,
+        n_jobs=-1
     )
 
+    # Fit the model
     search.fit(X_train, y_train)
 
     logger.info(f"Best parameters found: {search.best_params_}")
-    logger.info(f"Best score on cross-validation: {search.best_score_}")
+    logger.info(f"Best cross-validation F1 score: {search.best_score_:.4f}")
 
-    best_model = search.best_estimator_
-    y_pred = best_model.predict(X_val)
-    logger.info(f"Validation Accuracy: {accuracy_score(y_val, y_pred)}")
+    # Evaluate on validation set
+    y_pred = search.predict(X_val)
+    logger.info(f"Validation Accuracy: {accuracy_score(y_val, y_pred):.4f}")
+    logger.info(f"Validation F1 Score: {search.score(X_val, y_val):.4f}")
     logger.info(f"Classification Report:\n{classification_report(y_val, y_pred)}")
 
-    globals()['model'] = best_model.named_steps['gbm']
+    # Save the best model
+    best_model = search.best_estimator_
+    model = best_model.named_steps['gbm']  # Extract the GBM model
 
     os.makedirs(MODEL_DIR, exist_ok=True)
     joblib.dump(model, MODEL_PATH)
-    joblib.dump({
-        'encoder_ip': encoder_ip,
-        'encoder_agent': encoder_agent,
-        'encoder_country': encoder_country,
-        'encoder_region': encoder_region,
-        'encoder_city': encoder_city,
-        'encoder_agent_type': encoder_agent_type,
-        'model_features': model_features
-    }, ENCODERS_PATH)
+    joblib.dump(encoders, ENCODERS_PATH)
+
+    # Save model features
+    joblib.dump({'model_features': model_features}, os.path.join(MODEL_DIR, 'model_features.joblib'))
 
     logger.info("Model training completed successfully with improvements.")
 
 def init_model():
     global model, encoder_ip, encoder_agent, encoder_country, encoder_region, encoder_city, encoder_agent_type, model_features
     try:
-        if os.path.exists(MODEL_PATH) and os.path.exists(ENCODERS_PATH):
+        if os.path.exists(MODEL_PATH) and os.path.exists(ENCODERS_PATH) and os.path.exists(os.path.join(MODEL_DIR, 'model_features.joblib')):
             model = joblib.load(MODEL_PATH)
             encoders = joblib.load(ENCODERS_PATH)
             encoder_ip = encoders['encoder_ip']
@@ -916,67 +971,80 @@ def init_model():
             encoder_region = encoders['encoder_region']
             encoder_city = encoders['encoder_city']
             encoder_agent_type = encoders['encoder_agent_type']
-            model_features = encoders['model_features']
+            model_features_dict = joblib.load(os.path.join(MODEL_DIR, 'model_features.joblib'))
+            model_features = model_features_dict['model_features']
             logger.info("Model and encoders loaded successfully")
         else:
-            logger.info("No existing model found, training a new one...")
+            logger.info("No existing model or encoders found, training a new one...")
             prepare_and_train_model()
     except Exception as e:
-        logger.info(f"Error loading model or encoders: {e}")
+        logger.error(f"Error loading model or encoders: {e}")
         prepare_and_train_model()
+
 
 def generate_synthetic_attempts(num_samples):
     synthetic_data = []
-    common_user_agents = ['default_device', 'new_device', 'unknown_device']
+    common_user_agents = ['default_device', 'new_device']
+    user_ids = [1, 2, 3, 4, 5]  # Introduce multiple users
     
     for _ in range(num_samples):
-        user_devices = random.sample(common_user_agents, k=random.choices([1, 2, 3], weights=[0.6, 0.3, 0.1])[0])
-        current_device = random.choice(user_devices)
-        hour = random.randint(0, 23)
-        is_typical_hour = random.choices([1, 0], weights=[0.8, 0.2])[0]
-        is_trusted_location = random.choices([1, 0], weights=[0.8, 0.2])[0]
+        # Randomly select a user
+        user_id = random.choice(user_ids)
+        
+        # Decide if this attempt is normal or anomalous (80% normal, 20% anomalous)
+        is_anomalous = 1 if random.random() < 0.2 else 0
 
-        failed_attempts = random.randint(0, 5)
-        failed_attempts_24h = random.randint(failed_attempts, failed_attempts + 3)
-        unique_ips_24h = random.randint(1, 4)
-        unique_locations_24h = random.randint(1, 3)
-
-        is_anomalous = 0
-        if any([
-            failed_attempts >= 3,
-            failed_attempts_24h >= 5,
-            unique_ips_24h >= 3,
-            unique_locations_24h >= 3,
-            (not is_typical_hour and random.random() < 0.7),
-            (current_device == 'unknown_device' and random.random() < 0.8),
-            (len(user_devices) == 3 and random.random() < 0.6)
-        ]):
-            is_anomalous = 1
-
+        if is_anomalous:
+            # Generate anomalous attempt
+            user_agent = random.choice(['unknown_device'] + common_user_agents)
+            hour = random.choice([random.randint(0, 5), random.randint(20, 23)])  # Unusual hours
+            is_typical_hour = 0
+            country = random.choice(['Japan', 'Singapore', 'Unknown'])  # Untrusted locations
+            region = 'Unknown'
+            city = 'Unknown'
+            failed_attempts = random.randint(3, 5)
+            failed_attempts_24h = failed_attempts + random.randint(1, 3)
+            unique_ips_24h = random.randint(3, 5)
+            unique_locations_24h = random.randint(3, 5)
+        else:
+            # Generate normal attempt
+            user_agent = 'default_device'
+            hour = random.choice([9, 10, 11, 14, 15, 16])  # Typical office hours
+            is_typical_hour = 1
+            country = 'Taiwan'
+            region = 'Taipei'
+            city = 'Taipei'
+            failed_attempts = random.randint(0, 2)
+            failed_attempts_24h = failed_attempts
+            unique_ips_24h = random.randint(1, 2)
+            unique_locations_24h = random.randint(1, 2)
+        
+        # Build sample
         sample = {
-            'user_id': 1,
-            'ip_address': f'192.168.1.{random.randint(1, 255)}',
-            'user_agent': current_device,
+            'user_id': user_id,
+            'ip_address': f'192.168.{random.randint(0, 255)}.{random.randint(1, 255)}',
+            'user_agent': user_agent,
             'hour': hour,
             'day_of_week': random.randint(0, 6),
             'is_typical_hour': is_typical_hour,
-            'country': 'Taiwan' if is_trusted_location else random.choice(['Japan', 'Singapore', 'Unknown']),
-            'region': 'Taipei' if is_trusted_location else 'Unknown',
-            'city': 'Taipei' if is_trusted_location else 'Unknown',
+            'country': country,
+            'region': region,
+            'city': city,
             'failed_attempts': failed_attempts,
-            'attempts_24h': random.randint(max(failed_attempts_24h, 1), failed_attempts_24h + 10),
+            'attempts_24h': max(failed_attempts_24h, 1),
             'failed_attempts_24h': failed_attempts_24h,
             'unique_ips_24h': unique_ips_24h,
             'unique_locations_24h': unique_locations_24h,
-            'is_trusted_country': is_trusted_location,
-            'is_trusted_region': is_trusted_location,
-            'is_trusted_city': is_trusted_location,
+            'is_trusted_country': 1 if country == 'Taiwan' else 0,
+            'is_trusted_region': 1 if region == 'Taipei' else 0,
+            'is_trusted_city': 1 if city == 'Taipei' else 0,
             'time_anomaly': 1 - is_typical_hour,
             'label': is_anomalous
         }
         synthetic_data.append(sample)
     
     return synthetic_data
+
 
 def schedule_model_retraining():
     # If you don't want automatic retraining, you can remove this entirely
@@ -1093,10 +1161,10 @@ def logout():
 @app.route('/initialize_data', methods=['POST'])
 def initialize_data():
     try:
-        synthetic_data = generate_synthetic_attempts(2000)
+        synthetic_data = generate_synthetic_attempts(5000)
         
         for entry in synthetic_data:
-            user = User.query.get(entry['user_id'])
+            user = db.session.get(User, entry['user_id'])
             if not user:
                 user = User(
                     id=entry['user_id'],
@@ -1113,7 +1181,7 @@ def initialize_data():
                 user_id=entry['user_id'],
                 ip_address=entry['ip_address'],
                 user_agent=entry['user_agent'],
-                login_time=datetime.datetime.now() - datetime.timedelta(days=random.randint(0, 30)),
+                login_time=datetime.datetime.now() - datetime.timedelta(days=random.randint(0, 30), hours=random.randint(0,23)),
                 login_hour=entry['hour'],
                 login_day=entry['day_of_week'],
                 country=entry['country'],
@@ -1142,19 +1210,21 @@ def initialize_data():
         
         db.session.commit()
         
-        # Retrain once after initialization if you want:
+        # Retrain once after initialization
         prepare_and_train_model()
         
         return jsonify({'status': 'success', 'message': 'Data initialized and model trained'})
     except Exception as e:
         db.session.rollback()
+        logger.error(f"Error initializing data: {e}")
         return jsonify({'status': 'error', 'message': str(e)})
+
 
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
         # Only train if no model exists. If you want fewer retrains, remove unneeded calls.
-        if LoginAttempt.query.count() == 0:
+        if not os.path.exists(MODEL_PATH):
             with app.test_client() as client:
                 client.post('/initialize_data')
         init_model()
