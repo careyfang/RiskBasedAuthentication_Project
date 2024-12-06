@@ -1082,10 +1082,8 @@ def generate_synthetic_attempts(num_samples):
 
 
 def schedule_model_retraining():
-    # If you don't want automatic retraining, you can remove this entirely
     scheduler = BackgroundScheduler()
-    # Remove or comment out if you do not want periodic retraining
-    # scheduler.add_job(func=prepare_and_train_model, trigger="interval", hours=1)
+    scheduler.add_job(func=prepare_and_train_model, trigger="interval", minutes=5)
     scheduler.start()
 
 @app.route('/test_location', methods=['POST'])
@@ -1265,4 +1263,5 @@ if __name__ == '__main__':
             with app.test_client() as client:
                 client.post('/initialize_data')
         init_model()
+        schedule_model_retraining()
     app.run(debug=True, host='0.0.0.0', port=5000)
