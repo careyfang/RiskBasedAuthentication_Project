@@ -595,6 +595,10 @@ def calculate_travel_risk(previous_location, current_location, time_difference_h
         coords2 = get_cached_coords(current_location['city'],
                                     current_location['region'],
                                     current_location['country'])
+        
+        if coords1 is None or coords2 is None:
+            logger.error("Coordinates could not be retrieved, cannot calculate travel risk.")
+            return 0.0, {"error": "Coordinates not found for given locations."}
 
         distance = geodesic(coords1, coords2).miles
         MIN_TIME = 0.016667  # 1 minute in hours
@@ -1231,7 +1235,5 @@ def add_to_trusted_devices(user_id, user_agent):
             logger.info("Device added successfully")
 
 if __name__ == '__main__':
-    if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
-        # Only initialize when the reloader is active
-        init_model()
+    init_model()
     app.run(debug=True, host='0.0.0.0', port=5000)
