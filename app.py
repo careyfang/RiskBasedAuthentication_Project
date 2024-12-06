@@ -49,6 +49,7 @@ encoder_agent = LabelEncoder()
 encoder_country = LabelEncoder()
 encoder_region = LabelEncoder()
 encoder_city = LabelEncoder()
+encoder_agent_type = LabelEncoder()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -630,7 +631,7 @@ def calculate_travel_risk(previous_location, current_location, time_difference_h
         return 0.0, {"error": str(e)}
 
 def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, user, prev_location=None, current_location=None, time_diff_hours=0.0):
-    global model, encoder_ip, encoder_agent, encoder_country, encoder_region, encoder_city, model_features
+    global model, encoder_ip, encoder_agent, encoder_country, encoder_region, encoder_city, encoder_agent_type, model_features
 
     if not os.path.exists(ENCODERS_PATH):
         logger.warning("Encoders not found, returning default risk assessment")
@@ -649,12 +650,8 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
         encoder_country = encoders['encoder_country']
         encoder_region = encoders['encoder_region']
         encoder_city = encoders['encoder_city']
+        encoder_agent_type = encoders['encoder_agent_type']
         model_features = encoders['model_features']
-
-        # IMPORTANT: Retrieve the encoder for user_agent_type
-        # The encoder for user_agent_type was named based on feature.split("_")[0].
-        # For 'user_agent_type', feature.split("_")[0] is 'user', so we get encoder_user.
-        encoder_user = encoders['encoder_user']
 
     except Exception as e:
         logger.error(f"Failed to load encoders: {e}")
@@ -733,7 +730,7 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
         'is_trusted_country': is_trusted_country,
         'is_trusted_region': is_trusted_region,
         'is_trusted_city': is_trusted_city,
-        'user_agent_type_encoded': safe_encode(encoder_user, user_agent_type)  # ADD THIS LINE
+        'user_agent_type_encoded': safe_encode(encoder_agent_type, user_agent_type)
     }
 
     if model is None or not os.path.exists(MODEL_PATH):
@@ -742,10 +739,12 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
     else:
         try:
             X = pd.DataFrame([features])[model_features]
-            base_risk = model.predict_proba(X)[0][1]
+            # Convert DataFrame to numpy array to avoid feature names warning
+            X_array = X.to_numpy()
+            base_risk = model.predict_proba(X_array)[0][1]
             logger.info(f"ML model prediction: {base_risk}")
         except Exception as e:
-            logger.error(f"Error in ML prediction: {e}")
+            logger.error(f"Error in ML prediction: {str(e)}")
             base_risk = 0.3
 
     # Simplified risk score calculation
@@ -763,7 +762,7 @@ def assess_risk_ml(ip_address, user_agent, login_time, country, region, city, us
     }
 
 def prepare_and_train_model():
-    global model, encoder_ip, encoder_agent, encoder_country, encoder_region, encoder_city, model_features
+    global model, encoder_ip, encoder_agent, encoder_country, encoder_region, encoder_city, encoder_agent_type, model_features
 
     attempts = LoginAttempt.query.all()
     if not attempts:
@@ -899,13 +898,14 @@ def prepare_and_train_model():
         'encoder_country': encoder_country,
         'encoder_region': encoder_region,
         'encoder_city': encoder_city,
+        'encoder_agent_type': encoder_agent_type,
         'model_features': model_features
     }, ENCODERS_PATH)
 
     logger.info("Model training completed successfully with improvements.")
 
 def init_model():
-    global model, encoder_ip, encoder_agent, encoder_country, encoder_region, encoder_city, model_features
+    global model, encoder_ip, encoder_agent, encoder_country, encoder_region, encoder_city, encoder_agent_type, model_features
     try:
         if os.path.exists(MODEL_PATH) and os.path.exists(ENCODERS_PATH):
             model = joblib.load(MODEL_PATH)
@@ -915,6 +915,7 @@ def init_model():
             encoder_country = encoders['encoder_country']
             encoder_region = encoders['encoder_region']
             encoder_city = encoders['encoder_city']
+            encoder_agent_type = encoders['encoder_agent_type']
             model_features = encoders['model_features']
             logger.info("Model and encoders loaded successfully")
         else:
