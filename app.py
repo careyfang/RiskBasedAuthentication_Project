@@ -138,7 +138,6 @@ def confirm_email(token):
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if request.method == 'POST':
-        # Get form data
         username = request.form['username']
         password = request.form['password']
         confirm_password = request.form['confirm_password']
@@ -151,44 +150,46 @@ def register():
             flash('Passwords do not match. Please try again.')
             return render_template('register.html')
 
-        # Hash the password
-        password_hash = generate_password_hash(password)
-
-        # Check if user already exists
+        # Check if user or email already exists
         existing_user = User.query.filter_by(username=username).first()
+        existing_email = User.query.filter_by(email=email).first()
+        
         if existing_user:
             flash('Username already exists. Please choose another one.')
             return render_template('register.html')
+        
+        if existing_email:
+            flash('Email already registered. Please use a different email.')
+            return render_template('register.html')
 
-        # Create user but don't commit yet
-        new_user = User(
-            username=username,
-            password=password_hash,
-            email=email,
-            security_question=security_question,
-            security_answer=security_answer
-        )
-        db.session.add(new_user)
-        db.session.flush()  # Get new_user.id without committing
-
-        # Generate email verification token
-        token = serializer.dumps(email, salt='email-confirm')
-
-        # Send verification email
-        confirm_url = url_for('confirm_email', token=token, _external=True)
-        msg = Message('Confirm Your Email', sender=app.config['MAIL_USERNAME'], recipients=[email])
-        msg.body = f'Please click the link to confirm your email: {confirm_url}'
+        # Create new user
         try:
-            mail.send(msg)
-            print(f"Confirmation email sent to {email}")
+            password_hash = generate_password_hash(password)
+            new_user = User(
+                username=username,
+                password=password_hash,
+                email=email,
+                security_question=security_question,
+                security_answer=security_answer
+            )
+            db.session.add(new_user)
             db.session.commit()
+            
+            # Send verification email
+            token = serializer.dumps(email, salt='email-confirm')
+            confirm_url = url_for('confirm_email', token=token, _external=True)
+            msg = Message('Confirm Your Email', sender=app.config['MAIL_USERNAME'], recipients=[email])
+            msg.body = f'Please click the link to confirm your email: {confirm_url}'
+            mail.send(msg)
+            
+            flash('Registration successful! Please check your email to confirm your account.')
+            return redirect(url_for('login'))
+            
         except Exception as e:
-            print(f"Failed to send confirmation email: {e}")
             db.session.rollback()
-            return 'Failed to send confirmation email. Please try again later.', 500
-
-        # Inform the user to check their email
-        return 'A confirmation email has been sent. Please check your email to complete registration.'
+            logger.error(f"Registration error: {str(e)}")
+            flash('An error occurred during registration. Please try again.')
+            return render_template('register.html')
 
     return render_template('register.html')
 
@@ -203,15 +204,16 @@ def security_question():
         if not user:
             return redirect(url_for('login'))
 
-        entered_answer = request.form.get('security_answer').strip().lower()  # Normalize input
+        entered_answer = request.form.get('security_answer').strip().lower()
         if entered_answer and check_password_hash(user.security_answer, entered_answer):
             # Mark the latest attempt as legitimate
             login_attempt = LoginAttempt.query.filter_by(user_id=user_id).order_by(LoginAttempt.id.desc()).first()
             if login_attempt:
                 login_attempt.label = 0
-                add_to_trusted_locations(user_id, login_attempt)
+                add_to_trusted_locations(user_id, login_attempt)  # Add location to trusted
                 add_to_trusted_devices(user_id, login_attempt.user_agent)
                 db.session.commit()
+                logger.info(f"Security question verified for user {user.username}")
                 prepare_and_train_model()
 
             # Clear any failed attempts counter
@@ -233,27 +235,31 @@ def security_question():
 
 def add_to_trusted_locations(user_id, login_attempt):
     """Add location to trusted locations after successful verification"""
-    # Only add trusted locations if not in test mode and during training
-    is_test = session.get('is_test_mode', False)
-    is_training = session.get('is_initial_training', False)
-    should_trust = is_training and not is_test
-
-    if should_trust and login_attempt:
-        existing_location = TrustedLocation.query.filter_by(
-            user_id=user_id,
-            country=login_attempt.country,
-            region=login_attempt.region,
-            city=login_attempt.city
-        ).first()
-
-        if not existing_location:
-            new_location = TrustedLocation(
+    if login_attempt:
+        try:
+            existing_location = TrustedLocation.query.filter_by(
                 user_id=user_id,
                 country=login_attempt.country,
                 region=login_attempt.region,
                 city=login_attempt.city
-            )
-            db.session.add(new_location)
+            ).first()
+
+            if not existing_location and None not in [login_attempt.country, login_attempt.region, login_attempt.city]:
+                new_location = TrustedLocation(
+                    user_id=user_id,
+                    country=login_attempt.country,
+                    region=login_attempt.region,
+                    city=login_attempt.city
+                )
+                db.session.add(new_location)
+                db.session.commit()
+                logger.info(f"Added new trusted location: {login_attempt.city}, {login_attempt.region}, {login_attempt.country}")
+            elif existing_location:
+                logger.info(f"Location already trusted: {login_attempt.city}, {login_attempt.region}, {login_attempt.country}")
+            else:
+                logger.warning("Invalid location data, not adding to trusted locations")
+        except Exception as e:
+            logger.error(f"Error adding trusted location: {str(e)}")
 
 def get_client_ip():
     # For testing: check if there's a test IP in session
@@ -481,9 +487,10 @@ def verify_identity():
                 
                 if login_attempt:
                     login_attempt.label = 0  # Mark as legitimate
-                    add_to_trusted_locations(user_id, login_attempt)
+                    add_to_trusted_locations(user_id, login_attempt)  # Add location to trusted
                     add_to_trusted_devices(user_id, login_attempt.user_agent)
                     db.session.commit()
+                    logger.info(f"Verification successful for user {user.username}")
                     prepare_and_train_model()
 
                 # Clear any failed attempts counter
@@ -1269,6 +1276,13 @@ def get_cached_coords(city, region, country):
     except Exception as e:
         logger.error(f"Error in get_cached_coords: {str(e)}")
         return None
+
+@app.route('/logout')
+def logout():
+    # Clear all session data
+    session.clear()
+    flash('You have been logged out successfully.')
+    return redirect(url_for('login'))
 
 if __name__ == '__main__':
     with app.app_context():

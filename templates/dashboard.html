@@ -5,6 +5,20 @@
     <title>Dashboard</title>
 </head>
 <body>
+    <div class="header-actions">
+        <form action="{{ url_for('logout') }}" method="get" style="display: inline;">
+            <button type="submit" class="btn btn-danger">Logout</button>
+        </form>
+    </div>
+
+    <style>
+    .header-actions {
+        position: absolute;
+        top: 20px;
+        right: 20px;
+    }
+    </style>
+
     <h1>Welcome, {{ username }}!</h1>
     <p><strong>Final Risk Score:</strong> {{ risk_score }}</p>
 
