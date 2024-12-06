@@ -21,6 +21,8 @@ import joblib
 from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
 from config.test_locations import get_cached_coords, LOCATION_CACHE
+from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
+import time
 
 app = Flask(__name__)
 app.secret_key = 'your_secret_key'  # Replace with a secure key
@@ -54,6 +56,12 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(BASE_DIR, 'models')
 MODEL_PATH = os.path.join(MODEL_DIR, 'model.joblib')
 ENCODERS_PATH = os.path.join(MODEL_DIR, 'encoders.joblib')
+
+# Global geocoder instance with a custom user agent
+geolocator = Nominatim(user_agent="rba_application")
+
+# Location cache as a global dictionary
+LOCATION_CACHE = {}
 
 def safe_encode(encoder, value):
     """Safely encode values, handling unknown categories"""
@@ -459,7 +467,13 @@ def dashboard():
 def verify_identity():
     if request.method == 'POST':
         entered_otp = request.form.get('otp')
-        if 'otp' in session and entered_otp == session['otp']:
+        stored_otp = session.get('otp')
+        
+        if not stored_otp:
+            flash('OTP session expired. Please try again.', 'error')
+            return render_template('verify_identity.html')
+            
+        if entered_otp == stored_otp:
             user_id = session.get('user_id')
             if user_id:
                 user = db.session.get(User, user_id)
@@ -467,64 +481,38 @@ def verify_identity():
                 
                 if login_attempt:
                     login_attempt.label = 0  # Mark as legitimate
-                    
-                    # Check if this is one of the user's first logins
-                    login_count = LoginAttempt.query.filter_by(
-                        user_id=user_id,
-                        label=0
-                    ).count()
-                    
-                    # Trust location after successful verification unless it's a test
-                    is_test = session.get('is_test_mode', False)
-                    should_trust = not is_test  # Trust unless explicitly in test mode
-                    
-                    if should_trust and all(x not in ['Unknown', 'None'] 
-                                          for x in [login_attempt.country, 
-                                                  login_attempt.region, 
-                                                  login_attempt.city]):
-                        
-                        existing_location = TrustedLocation.query.filter_by(
-                            user_id=user_id,
-                            country=login_attempt.country,
-                            region=login_attempt.region,
-                            city=login_attempt.city
-                        ).first()
-
-                        if not existing_location:
-                            print(f"Adding trusted location: {login_attempt.country}, {login_attempt.region}, {login_attempt.city}")
-                            new_location = TrustedLocation(
-                                user_id=user_id,
-                                country=login_attempt.country,
-                                region=login_attempt.region,
-                                city=login_attempt.city
-                            )
-                            db.session.add(new_location)
-                    
-                    # Add device to trusted devices
+                    add_to_trusted_locations(user_id, login_attempt)
                     add_to_trusted_devices(user_id, login_attempt.user_agent)
-                    
                     db.session.commit()
                     prepare_and_train_model()
 
-                # Complete login
-                session['user_id'] = user_id
+                # Clear any failed attempts counter
+                if user:
+                    user.failed_attempts = 0
+                    db.session.commit()
+                
+                # Complete login and cleanup session
                 session.pop('otp', None)
                 session.pop('otp_generated_at', None)
                 session.pop('otp_attempts', None)
                 session.pop('is_business_trip', None)
                 session.pop('is_initial_training', None)
                 session.pop('is_test_mode', None)
-
+                
                 return redirect(url_for('dashboard'))
-    else:
-        # Generate an OTP code and store it in the session
-        otp_code = str(randint(100000, 999999))
-        session['otp'] = otp_code
-        session['otp_generated_at'] = datetime.datetime.now().isoformat()
-        session['otp_attempts'] = 0
+        else:
+            flash('Incorrect OTP. Please try again.', 'error')
+            return render_template('verify_identity.html')
+    
+    # Generate new OTP for GET request
+    otp_code = str(randint(100000, 999999))
+    session['otp'] = otp_code
+    session['otp_generated_at'] = datetime.datetime.now().isoformat()
+    session['otp_attempts'] = 0
 
-        # Send OTP via email
-        user_id = session.get('user_id')
+    # Send OTP via email
+    user_id = session.get('user_id')
+    if user_id:
         user = User.query.get_or_404(user_id)
         if user:
             msg = Message('Your OTP Code', sender=app.config['MAIL_USERNAME'], recipients=[user.email])
@@ -533,12 +521,10 @@ def verify_identity():
                 mail.send(msg)
                 print(f"OTP code sent to user {user.username} at {user.email}")
             except Exception as e:
-                print(f"Failed to send OTP email: {e}")
-                return f'Failed to send OTP. Error: {e}', 500
-        else:
-            return 'User not found.', 404
-
-        return render_template('verify_identity.html')
+                flash('Failed to send OTP email. Please try again.', 'error')
+                return render_template('verify_identity.html')
+    
+    return render_template('verify_identity.html')
 
 def get_user_typical_hours(user_id):
     # Fetch legitimate login attempts for the user
@@ -592,28 +578,38 @@ def label_attempt(user_id, ip_address, user_agent, country, region, city):
     return 0  # Mark as legitimate
 
 def calculate_travel_risk(previous_location, current_location, time_difference_hours):
-    # Check for None locations before attempting to use them
-    if previous_location is None or current_location is None:
-        logger.error("Previous or current location is None, cannot calculate travel risk.")
-        return 0.0, {"error": "One or both locations are None."}
+    """Calculate travel risk with better error handling"""
+    # Check for None locations
+    if not previous_location or not current_location:
+        logger.warning("Previous or current location is None")
+        return 0.0, {"error": "One or both locations are None"}
 
-    # Check for 'Local', 'Unknown', or 'None' values in the location data
-    if any(x in ['Local', 'Unknown', 'None']
-           for loc in [previous_location, current_location]
+    # Skip calculation for special cases
+    if any(x in ['Local', 'Unknown', None] 
+           for loc in [previous_location, current_location] 
            for x in loc.values()):
-        return 0.0, {"error": "Local or unknown locations - skipping travel calculation"}
+        logger.info("Skipping travel calculation for Local/Unknown locations")
+        return 0.0, {"info": "Local or unknown locations - skipping calculation"}
 
     try:
-        coords1 = get_cached_coords(previous_location['city'],
-                                    previous_location['region'],
-                                    previous_location['country'])
-        coords2 = get_cached_coords(current_location['city'],
-                                    current_location['region'],
-                                    current_location['country'])
-        
-        if coords1 is None or coords2 is None:
-            logger.error("Coordinates could not be retrieved, cannot calculate travel risk.")
-            return 0.0, {"error": "Coordinates not found for given locations."}
+        coords1 = get_cached_coords(
+            previous_location['city'],
+            previous_location['region'],
+            previous_location['country']
+        )
+        coords2 = get_cached_coords(
+            current_location['city'],
+            current_location['region'],
+            current_location['country']
+        )
+
+        if not coords1 or not coords2:
+            logger.warning("Could not retrieve coordinates for one or both locations")
+            return 0.0, {
+                "error": "Could not retrieve coordinates",
+                "previous": previous_location,
+                "current": current_location
+            }
 
         distance = geodesic(coords1, coords2).miles
         MIN_TIME = 0.016667  # 1 minute in hours
@@ -1234,11 +1230,44 @@ def add_to_trusted_devices(user_id, user_agent):
             logger.info("Device added successfully")
 
 def get_cached_coords(city, region, country):
-    """Get coordinates with better error handling"""
+    """Get coordinates with better caching and error handling"""
+    location_key = f"{city}, {region}, {country}"
+    
+    # Return from cache if available
+    if location_key in LOCATION_CACHE:
+        return LOCATION_CACHE[location_key]
+    
+    # Skip geocoding for special cases
+    if 'Local' in [city, region, country] or 'Unknown' in [city, region, country]:
+        return None
+        
     try:
-        return LOCATION_CACHE.get(f"{city}, {region}, {country}")
+        # Try different location string formats
+        location_strings = [
+            f"{city}, {region}, {country}",
+            f"{city}, {country}",
+            f"{region}, {country}",
+            country
+        ]
+        
+        for loc_str in location_strings:
+            try:
+                location = geolocator.geocode(loc_str, timeout=10)
+                if location:
+                    coords = (location.latitude, location.longitude)
+                    LOCATION_CACHE[location_key] = coords
+                    logger.info(f"Retrieved coordinates for {loc_str}: {coords}")
+                    return coords
+                time.sleep(1)  # Rate limiting
+            except (GeocoderTimedOut, GeocoderUnavailable) as e:
+                logger.warning(f"Geocoding attempt failed for {loc_str}: {str(e)}")
+                continue
+                
+        logger.error(f"Could not find coordinates for {location_key}")
+        return None
+        
     except Exception as e:
-        logger.error(f"Error getting coordinates: {e}")
+        logger.error(f"Error in get_cached_coords: {str(e)}")
         return None
 
 if __name__ == '__main__':
