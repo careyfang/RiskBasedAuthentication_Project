@@ -49,6 +49,12 @@ encoder_city = LabelEncoder()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Define paths relative to project directory
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(BASE_DIR, 'models')
+MODEL_PATH = os.path.join(MODEL_DIR, 'model.joblib')
+ENCODERS_PATH = os.path.join(MODEL_DIR, 'encoders.joblib')
+
 def safe_encode(encoder, value):
     """Safely encode values, handling unknown categories"""
     try:
@@ -189,18 +195,27 @@ def security_question():
         if not user:
             return redirect(url_for('login'))
 
-        entered_answer = request.form.get('security_answer')
-        if entered_answer and entered_answer.lower() == user.security_answer.lower():
+        entered_answer = request.form.get('security_answer').strip().lower()  # Normalize input
+        if entered_answer and check_password_hash(user.security_answer, entered_answer):
             # Mark the latest attempt as legitimate
             login_attempt = LoginAttempt.query.filter_by(user_id=user_id).order_by(LoginAttempt.id.desc()).first()
             if login_attempt:
                 login_attempt.label = 0
                 add_to_trusted_locations(user_id, login_attempt)
-                # Add device to trusted devices
                 add_to_trusted_devices(user_id, login_attempt.user_agent)
                 db.session.commit()
                 prepare_and_train_model()
 
+            # Clear any failed attempts counter
+            user.failed_attempts = 0
+            db.session.commit()
+            
+            # Complete login
+            session['user_id'] = user_id
+            session.pop('is_business_trip', None)
+            session.pop('is_initial_training', None)
+            session.pop('is_test_mode', None)
+            
             return redirect(url_for('dashboard'))
         else:
             flash('Incorrect answer. Please try again.', 'error')
@@ -1037,59 +1052,43 @@ def prepare_and_train_model():
     print("\nFeature Importance:")
     print(feature_importance)
 
-    # Save the model and encoders
-    joblib.dump(model, 'model.joblib')
+    # Save the model and encoders in project directory
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    joblib.dump(model, MODEL_PATH)
     joblib.dump({
         'encoder_ip': encoder_ip,
         'encoder_agent': encoder_agent,
         'encoder_country': encoder_country,
         'encoder_region': encoder_region,
         'encoder_city': encoder_city,
-        'model_features': features  # Use features directly here
-    }, 'encoders.joblib')
+        'model_features': features
+    }, ENCODERS_PATH)
+    logger.info(f"Model and encoders saved to {MODEL_DIR}")
 
 def init_model():
-    """Initialize the model once at startup"""
+    """Initialize or load the model at startup"""
     global model, encoder_ip, encoder_agent, encoder_country, encoder_region, encoder_city, model_features
     
-    with app.app_context():
-        db.create_all()
-        
-        # Common default values
-        common_user_agents = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15',
-            'Mozilla/5.0 (Linux; Android 10; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.162 Mobile Safari/537.36',
-            'Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1'
-        ]
-        
-        # Initialize and fit encoders with default values
-        encoder_ip = LabelEncoder().fit(['127.0.0.1', '192.168.1.1'])
-        encoder_agent = LabelEncoder().fit(common_user_agents)
-        encoder_country = LabelEncoder().fit(['Unknown', 'Taiwan', 'Japan', 'Singapore', 'United States'])
-        encoder_region = LabelEncoder().fit(['Unknown', 'Taipei', 'Tokyo', 'Singapore', 'California'])
-        encoder_city = LabelEncoder().fit(['Unknown', 'Taipei', 'Tokyo', 'Singapore', 'Mountain View'])
-        
-        # Try to load existing model and encoders
-        try:
-            model = joblib.load('model.joblib')
-            encoders = joblib.load('encoders.joblib')
+    try:
+        if os.path.exists(MODEL_PATH) and os.path.exists(ENCODERS_PATH):
+            model = joblib.load(MODEL_PATH)
+            encoders = joblib.load(ENCODERS_PATH)
             
-            # Update encoders with saved values while preserving default values
-            encoder_ip = LabelEncoder().fit(list(set(list(encoder_ip.classes_) + list(encoders['encoder_ip'].classes_))))
-            encoder_agent = LabelEncoder().fit(list(set(list(encoder_agent.classes_) + list(encoders['encoder_agent'].classes_))))
-            encoder_country = LabelEncoder().fit(list(set(list(encoder_country.classes_) + list(encoders['encoder_country'].classes_))))
-            encoder_region = LabelEncoder().fit(list(set(list(encoder_region.classes_) + list(encoders['encoder_region'].classes_))))
-            encoder_city = LabelEncoder().fit(list(set(list(encoder_city.classes_) + list(encoders['encoder_city'].classes_))))
-            
+            # Load encoders
+            encoder_ip = encoders['encoder_ip']
+            encoder_agent = encoders['encoder_agent']
+            encoder_country = encoders['encoder_country']
+            encoder_region = encoders['encoder_region']
+            encoder_city = encoders['encoder_city']
             model_features = encoders['model_features']
-            logger.info("Loaded existing model and merged encoder classes")
-        except Exception as e:
-            logger.info(f"Training new model... ({str(e)})")
+            
+            logger.info("Model and encoders loaded successfully")
+        else:
+            logger.info("Training new model...")
             prepare_and_train_model()
-        
-        schedule_model_retraining()
+    except Exception as e:
+        logger.info(f"Training new model... ({str(e)})")
+        prepare_and_train_model()
 
 def generate_synthetic_attempts(num_samples):
     synthetic_data = []
@@ -1234,6 +1233,18 @@ def add_to_trusted_devices(user_id, user_agent):
             db.session.commit()
             logger.info("Device added successfully")
 
+def get_cached_coords(city, region, country):
+    """Get coordinates with better error handling"""
+    try:
+        return LOCATION_CACHE.get(f"{city}, {region}, {country}")
+    except Exception as e:
+        logger.error(f"Error getting coordinates: {e}")
+        return None
+
 if __name__ == '__main__':
-    init_model()
+    with app.app_context():
+        # Create all database tables
+        db.create_all()
+        # Initialize the model
+        init_model()
     app.run(debug=True, host='0.0.0.0', port=5000)
