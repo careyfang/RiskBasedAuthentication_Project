@@ -1263,5 +1263,5 @@ if __name__ == '__main__':
             with app.test_client() as client:
                 client.post('/initialize_data')
         init_model()
-        schedule_model_retraining()
+        #schedule_model_retraining()
     app.run(debug=True, host='0.0.0.0', port=5000)
