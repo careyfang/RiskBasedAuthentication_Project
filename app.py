@@ -1259,9 +1259,9 @@ if __name__ == '__main__':
     with app.app_context():
         db.create_all()
         # Only train if no model exists. If you want fewer retrains, remove unneeded calls.
-        if not os.path.exists(MODEL_PATH):
-            with app.test_client() as client:
-                client.post('/initialize_data')
+        #if not os.path.exists(MODEL_PATH):
+        #    with app.test_client() as client:
+        #        client.post('/initialize_data')
         init_model()
         #schedule_model_retraining()
     app.run(debug=True, host='0.0.0.0', port=5000)
