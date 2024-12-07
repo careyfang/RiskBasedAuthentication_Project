@@ -1194,7 +1194,7 @@ def logout():
 @app.route('/initialize_data', methods=['POST'])
 def initialize_data():
     try:
-        synthetic_data = generate_synthetic_attempts(5000)
+        synthetic_data = generate_synthetic_attempts(2000)
         
         for entry in synthetic_data:
             user = db.session.get(User, entry['user_id'])
