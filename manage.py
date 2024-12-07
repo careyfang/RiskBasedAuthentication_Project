@@ -5,14 +5,6 @@ import sys
 import requests
 
 def main():
-    # Ensure the virtual environment is activated
-    activate_env = os.path.expanduser("/home/careyfang/.virtualenvs/rba_env/bin/activate_this.py")
-    if not os.path.exists(activate_env):
-        print("Error: Virtual environment activation script not found.")
-        sys.exit(1)
-    with open(activate_env) as f:
-        exec(f.read(), {'__file__': activate_env})
-
     # Set the Flask app environment variable
     os.environ['FLASK_APP'] = 'app.py'  # Replace 'app.py' if different
 
