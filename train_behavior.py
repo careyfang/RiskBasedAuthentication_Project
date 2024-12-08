@@ -15,9 +15,9 @@ class BehaviorTester:
     def __init__(self):
         self.session = requests.Session()
         self.base_url = 'http://localhost:5000'
-        self.username = 'carey'
+        self.username = 'careyfang'
         self.password = '1234'
-        self.security_answer = 'bibi'
+        self.security_answer = 'auth'
         
         # Simulated time tracking
         self.current_time = datetime.now().replace(hour=9, minute=0, second=0, microsecond=0)  # Start at 9 AM
@@ -207,7 +207,7 @@ class BehaviorTester:
             'ip': '203.0.113.2',
             'country': 'Taiwan',
             'region': 'Taipei',    # Same region as usual location
-            'city': 'Xindian'       # Unseen city within 'Taipei' region
+            'city': 'Yilan'       # Unseen city within 'Taipei' region
         }
         self.set_time(random.choice(self.usual_times))
         self.set_location(unseen_city_location)
